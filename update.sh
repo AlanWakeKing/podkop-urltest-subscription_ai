@@ -9,7 +9,7 @@ SOURCE_2=""
 SOURCE_3=""
 
 # Сколько максимум ключей класть в Podkop
-LIMIT=20
+LIMIT=27
 # -----------------
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
@@ -28,8 +28,18 @@ PATTERN='(vless|ss|trojan|socks|hy2)://[^"'"'"' <]+'
 clean_name() {
     printf '%s' "$1" | \
     sed 's/%20/ /g' | \
-    sed 's/[[:space:]]\+/_/g' | \
-    sed 's/[|,]/_/g'
+    sed 's/[[:cntrl:]]//g' | \
+    sed 's/["\\`]/_/g' | \
+    sed 's/[?#&]/_/g' | \
+    sed 's/[|,]/_/g' | \
+    sed 's/[[:space:]]\+/_/g'
+}
+
+is_valid_fp() {
+    case "$1" in
+        chrome|firefox|safari|ios|android|edge|360|random) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # --- СКАЧИВАНИЕ ---
@@ -47,11 +57,14 @@ download_content() {
 normalize_link() {
     raw="$1"
 
-    # убираем не-ASCII мусор (типа Â)
-    link=$(printf '%s' "$raw" | tr -cd '\11\12\15\40-\176')
-    # Чистим HTML-экранирование и пробелы по краям
-    link=$(printf '%s' "$raw" | sed 's/&amp;/\&/g; s/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -z "$link" ] && return 1
+    # Убираем мусор, чистим HTML-экранирование и пробелы по краям
+    link=$(printf '%s' "$raw" | tr -cd '\11\12\15\40-\176' | \
+       sed 's/&amp;/\&/g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    # Выкидываем обрезанные ключи (заканчиваются на & или =)
+    case "$link" in
+        *'='|*'&') return 1 ;;
+    esac
 
     # Принимаем только поддерживаемые схемы
     case "$link" in
@@ -90,6 +103,11 @@ normalize_link() {
     if [ "$path" != "$base" ]; then
         query="${base#*\?}"
     fi
+
+    # если есть пустые значения — выкидываем
+    printf '%s' "$query" | grep -qE '(^|&)security=(&|$)' && return 1
+    printf '%s' "$query" | grep -qE '(^|&)type=httpupgrade(&|$|#)' && return 1
+    printf '%s' "$query" | grep -qE '(^|&)fp=(&|$)' && return 1
 
     query=$(printf '%s' "$query" | sed 's/^&//; s/&&*/\&/g')
 
@@ -139,7 +157,7 @@ normalize_link() {
 
     # TYPE
     # Берём только нормальное значение, без хвостов и мусора
-    transport=$(printf '%s' "$raw" | sed -nE 's/.*[?&]type=([A-Za-z0-9]+).*/\1/p')
+    transport=$(printf '%s' "$query" | sed -nE 's/(^|&)type=([A-Za-z0-9]+).*/\2/p')
     transport=$(printf '%s' "$transport" | tr -cd 'a-zA-Z0-9')
 
     case "$transport" in
@@ -158,10 +176,8 @@ normalize_link() {
 
     # Reality без fp лучше не пускать
     if [ "$security" = "reality" ]; then
-        fp=$(printf '%s' "$base" | sed -nE 's/.*[?&]fp=([^&]*).*/\1/p')
-        if [ -z "$fp" ]; then
-            base="${base}&fp=chrome"
-        fi
+        fp=$(printf '%s' "$base" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
+        [ -z "$fp" ] && return 1
     fi
 
     # Чистим хвосты вида ?& / && / & в конце
@@ -269,9 +285,23 @@ uci set podkop.main.urltest_tolerance='150'
 uci set podkop.main.urltest_testing_url='https://cp.cloudflare.com/generate_204'
 
 # Записываем список ключей в конфиг
+WRITTEN=0
 while read -r link; do
     [ -n "$link" ] || continue
+    case "$link" in
+        *pbk=*)
+            fp=$(printf '%s' "$link" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
+            case "$fp" in
+                chrome|firefox|safari|ios|android|edge|360|random) ;;
+                *)
+                    log "⛔ Отброшен (fp='$fp'): $link"
+                    continue
+                    ;;
+            esac
+            ;;
+    esac
     uci add_list podkop.main.urltest_proxy_links="$link"
+    WRITTEN=$((WRITTEN + 1))
 done < "$TMP_FINAL"
 
 uci commit podkop
@@ -280,4 +310,4 @@ uci commit podkop
 log "🔄 Перезапуск сервиса..."
 /etc/init.d/podkop restart
 
-log "🚀 Обновление успешно завершено! Итого уникальных серверов: $TOTAL"
+log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
