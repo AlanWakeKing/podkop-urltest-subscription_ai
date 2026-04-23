@@ -8,6 +8,20 @@ SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
 
+# User-Agent, который увидит сервер подписки.
+SUBSCRIPTION_USER_AGENT="v2rayNG/1.8.5"
+
+# Файл с постоянным HWID. Если X_HWID пустой, скрипт возьмет значение отсюда
+# или создаст новый UUID при первом запуске.
+HWID_FILE="/etc/podkop-hwid"
+
+# Опциональный ручной override для HWID.
+X_HWID=""
+
+# Опциональные заголовки для вашего backend, если он показывает устройство в кабинете.
+X_OS="OpenWrt"
+X_MODEL="24.10.2"
+
 # Сколько максимум ключей класть в Podkop
 LIMIT=27
 # -----------------
@@ -42,10 +56,55 @@ is_valid_fp() {
     esac
 }
 
+generate_hwid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+        return 0
+    fi
+
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_hwid() {
+    [ -n "$X_HWID" ] && return 0
+
+    if [ -s "$HWID_FILE" ]; then
+        X_HWID=$(sed -n '1p' "$HWID_FILE" | tr -d '\r\n')
+        [ -n "$X_HWID" ] && return 0
+    fi
+
+    X_HWID=$(generate_hwid) || {
+        log "⚠️  Не удалось сгенерировать HWID"
+        return 1
+    }
+
+    if printf '%s\n' "$X_HWID" > "$HWID_FILE" 2>/dev/null; then
+        log "🆔 Создан новый HWID: $HWID_FILE"
+    else
+        log "⚠️  HWID сгенерирован, но не сохранен в $HWID_FILE"
+    fi
+}
+
 # --- СКАЧИВАНИЕ ---
 # Загружает сырой текст/HTML/подписку
 download_content() {
-    raw=$(wget --no-check-certificate --user-agent="v2rayNG/1.8.5" -qO- "$1" 2>/dev/null)
+    url="$1"
+
+    set -- \
+        --no-check-certificate \
+        --user-agent="$SUBSCRIPTION_USER_AGENT" \
+        -qO-
+
+    [ -n "$X_HWID" ] && set -- "$@" --header="X-HWID: $X_HWID"
+    [ -n "$X_OS" ] && set -- "$@" --header="X-OS: $X_OS"
+    [ -n "$X_MODEL" ] && set -- "$@" --header="X-Model: $X_MODEL"
+
+    raw=$(wget "$@" "$url" 2>/dev/null)
     [ -n "$raw" ] || return 1
 
     # Если контент base64 — декодируем, иначе возвращаем как есть
@@ -230,6 +289,7 @@ collect() {
 
 # --- СТАРТ ---
 log "📥 Сбор ключей..."
+ensure_hwid
 collect "$SOURCE_1" "1"
 collect "$SOURCE_2" "2"
 collect "$SOURCE_3" "3"
