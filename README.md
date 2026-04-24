@@ -21,7 +21,7 @@
 ### ✦ Шаг 1: Установка
 Подключитесь по **SSH** к роутеру и выполните команду:
 ```bash
-wget -O /usr/bin/podkop-update https://raw.githubusercontent.com/Naz1anmak/podkop-urltest-subscription/main/update.sh && \
+wget -O /usr/bin/podkop-update https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh
 chmod +x /usr/bin/podkop-update
 ```
 
