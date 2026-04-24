@@ -107,10 +107,7 @@ sed -i '/podkop-update/d' /etc/crontabs/root && \
 - Проверка доступности серверов выполняется самим Podkop (URLTest)
 - Если ключей нет или после фильтрации не осталось рабочих вариантов, текущий конфиг не меняется
 
----
-#### DONATE:
-- **[T-Банк × CloudTips](https://pay.cloudtips.ru/p/c70b7d78)**
----
-
 ## ❤️  Большое спасибо
 - **[itdoginfo](https://github.com/itdoginfo)** за [Podkop](https://github.com/itdoginfo/podkop)
+
+- **[Naz1anmak](https://github.com/Naz1anmak)** за [podkop-urltest-subscription](https://github.com/Naz1anmak/podkop-urltest-subscription)
