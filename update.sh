@@ -18,9 +18,18 @@ HWID_FILE="/etc/podkop-hwid"
 # Опциональный ручной override для HWID.
 X_HWID=""
 
-# Опциональные заголовки для вашего backend, если он показывает устройство в кабинете.
-X_OS="OpenWrt"
-X_MODEL="24.10.2"
+# Заголовки устройства для bot-vpn/subpage:
+# - X-Device-OS
+# - X-Ver-OS
+# - X-Device-Model
+X_DEVICE_OS="OpenWrt"
+X_VER_OS="24.10.2"
+X_DEVICE_MODEL="VM_x86_64"
+
+# Устаревшие совместимые переменные.
+# Если они заданы, скрипт постарается корректно преобразовать их в новые поля.
+X_OS=""
+X_MODEL=""
 
 # Автоматически поддерживать cron-задачу для обновления подписок.
 AUTO_INSTALL_CRON="1"
@@ -76,6 +85,38 @@ generate_hwid() {
     return 1
 }
 
+detect_openwrt_version() {
+    if [ -r /etc/openwrt_release ]; then
+        sed -n "s/^DISTRIB_RELEASE=['\"]\\{0,1\\}\\([^'\"]*\\)['\"]\\{0,1\\}$/\\1/p" /etc/openwrt_release | sed -n '1p'
+        return 0
+    fi
+
+    return 1
+}
+
+detect_openwrt_model() {
+    if [ -s /tmp/sysinfo/model ]; then
+        sed -n '1p' /tmp/sysinfo/model
+        return 0
+    fi
+
+    if [ -r /proc/device-tree/model ]; then
+        tr -d '\000' < /proc/device-tree/model
+        return 0
+    fi
+
+    return 1
+}
+
+is_version_like() {
+    case "$1" in
+        '' ) return 1 ;;
+        *[!0-9._-]* ) return 1 ;;
+        *[0-9]*.*[0-9]* ) return 0 ;;
+        * ) return 1 ;;
+    esac
+}
+
 ensure_hwid() {
     [ -n "$X_HWID" ] && return 0
 
@@ -93,6 +134,26 @@ ensure_hwid() {
         log "🆔 Создан новый HWID: $HWID_FILE"
     else
         log "⚠️  HWID сгенерирован, но не сохранен в $HWID_FILE"
+    fi
+}
+
+ensure_device_headers() {
+    [ -n "$X_DEVICE_OS" ] || X_DEVICE_OS="$X_OS"
+
+    if [ -z "$X_VER_OS" ]; then
+        if is_version_like "$X_MODEL"; then
+            X_VER_OS="$X_MODEL"
+        else
+            X_VER_OS="$(detect_openwrt_version)"
+        fi
+    fi
+
+    if [ -z "$X_DEVICE_MODEL" ]; then
+        if [ -n "$X_MODEL" ] && ! is_version_like "$X_MODEL"; then
+            X_DEVICE_MODEL="$X_MODEL"
+        else
+            X_DEVICE_MODEL="$(detect_openwrt_model)"
+        fi
     fi
 }
 
@@ -141,6 +202,9 @@ download_content() {
         -qO-
 
     [ -n "$X_HWID" ] && set -- "$@" --header="X-HWID: $X_HWID"
+    [ -n "$X_DEVICE_OS" ] && set -- "$@" --header="X-Device-OS: $X_DEVICE_OS"
+    [ -n "$X_VER_OS" ] && set -- "$@" --header="X-Ver-OS: $X_VER_OS"
+    [ -n "$X_DEVICE_MODEL" ] && set -- "$@" --header="X-Device-Model: $X_DEVICE_MODEL"
     [ -n "$X_OS" ] && set -- "$@" --header="X-OS: $X_OS"
     [ -n "$X_MODEL" ] && set -- "$@" --header="X-Model: $X_MODEL"
 
@@ -330,6 +394,7 @@ collect() {
 # --- СТАРТ ---
 log "📥 Сбор ключей..."
 ensure_hwid
+ensure_device_headers
 ensure_cron_job
 collect "$SOURCE_1" "1"
 collect "$SOURCE_2" "2"

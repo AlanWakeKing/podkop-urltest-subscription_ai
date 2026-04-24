@@ -56,14 +56,26 @@ HWID_FILE="/etc/podkop-hwid"
 Если вы хотите, чтобы ваш backend видел устройство подробнее, можно также задать:
 ```bash
 SUBSCRIPTION_USER_AGENT="Happ/2.7.0/Windows/2604031533507"
-X_OS="Windows 10_10.0.19045"
-X_MODEL="Parts_x86_64"
+X_DEVICE_OS="Windows"
+X_VER_OS="10.0.19045"
+X_DEVICE_MODEL="Parts_x86_64"
 ```
 Тогда при запросе подписки скрипт отправит:
 - `User-Agent: ...`
 - `X-HWID: ...`
-- `X-OS: ...`
-- `X-Model: ...`
+- `X-Device-OS: ...`
+- `X-Ver-OS: ...`
+- `X-Device-Model: ...`
+
+Для сервиса `bot-vpn` это важно: он читает именно `X-Device-OS`, `X-Ver-OS` и `X-Device-Model`. Старые `X-OS` и `X-Model` оставлены только для совместимости.
+
+Для OpenWrt можно оставить значения по умолчанию:
+```bash
+X_DEVICE_OS="OpenWrt"
+X_VER_OS=""
+X_DEVICE_MODEL=""
+```
+Тогда версия OpenWrt и модель роутера будут по возможности определены автоматически.
 
 `IP адрес`, `Последний доступ` и `Количество обращений` формируются уже на стороне вашего сервиса по самому факту HTTP-запроса.
 
