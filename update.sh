@@ -606,6 +606,8 @@ collect() {
     input="$1"
     num="$2"
 
+    [ -n "$input" ] || return 0
+
     case "$input" in
         vless://*|ss://*|trojan://*|socks://*|hy2://*)
             norm=$(normalize_link "$input") || {
