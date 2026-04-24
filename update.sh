@@ -22,6 +22,12 @@ X_HWID=""
 X_OS="OpenWrt"
 X_MODEL="24.10.2"
 
+# Автоматически поддерживать cron-задачу для обновления подписок.
+AUTO_INSTALL_CRON="1"
+CRON_FILE="/etc/crontabs/root"
+CRON_SCHEDULE="0 */3 * * *"
+CRON_COMMAND="/usr/bin/podkop-update >> /var/log/podkop-update.log 2>&1"
+
 # Сколько максимум ключей класть в Podkop
 LIMIT=27
 # -----------------
@@ -88,6 +94,40 @@ ensure_hwid() {
     else
         log "⚠️  HWID сгенерирован, но не сохранен в $HWID_FILE"
     fi
+}
+
+ensure_cron_job() {
+    [ "$AUTO_INSTALL_CRON" = "1" ] || return 0
+
+    cron_line="${CRON_SCHEDULE} ${CRON_COMMAND}"
+
+    if [ -f "$CRON_FILE" ] && grep -Fxq "$cron_line" "$CRON_FILE"; then
+        return 0
+    fi
+
+    if [ ! -f "$CRON_FILE" ]; then
+        : > "$CRON_FILE" 2>/dev/null || {
+            log "⚠️  Не удалось создать $CRON_FILE"
+            return 1
+        }
+    fi
+
+    sed -i '/\/usr\/bin\/podkop-update/d' "$CRON_FILE" 2>/dev/null || {
+        log "⚠️  Не удалось обновить cron в $CRON_FILE"
+        return 1
+    }
+
+    printf '%s\n' "$cron_line" >> "$CRON_FILE" || {
+        log "⚠️  Не удалось записать cron-задачу"
+        return 1
+    }
+
+    /etc/init.d/cron restart >/dev/null 2>&1 || {
+        log "⚠️  Не удалось перезапустить cron"
+        return 1
+    }
+
+    log "⏰ Cron обновлен: $CRON_SCHEDULE"
 }
 
 # --- СКАЧИВАНИЕ ---
@@ -290,6 +330,7 @@ collect() {
 # --- СТАРТ ---
 log "📥 Сбор ключей..."
 ensure_hwid
+ensure_cron_job
 collect "$SOURCE_1" "1"
 collect "$SOURCE_2" "2"
 collect "$SOURCE_3" "3"
