@@ -7,6 +7,9 @@
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
+CONFIG_FILE="/etc/podkop-update.conf"
+UPDATE_INTERVAL_HOURS="3"
+FORCE_SETUP="0"
 
 # User-Agent, который увидит сервер подписки.
 SUBSCRIPTION_USER_AGENT="v2rayNG/1.8.5"
@@ -22,9 +25,9 @@ X_HWID=""
 # - X-Device-OS
 # - X-Ver-OS
 # - X-Device-Model
-X_DEVICE_OS="OpenWrt"
-X_VER_OS="24.10.2"
-X_DEVICE_MODEL="VM_x86_64"
+X_DEVICE_OS=""
+X_VER_OS=""
+X_DEVICE_MODEL=""
 
 # Устаревшие совместимые переменные.
 # Если они заданы, скрипт постарается корректно преобразовать их в новые поля.
@@ -48,6 +51,183 @@ TMP_POOL="$(mktemp)"
 TMP_FINAL="$(mktemp)"
 
 trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u"' EXIT INT TERM
+
+print_usage() {
+    cat <<EOF
+Использование:
+  $0 [--setup]
+
+Опции:
+  --setup   Запустить мастер настройки и сохранить ответы в $CONFIG_FILE
+EOF
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+prompt_required_number() {
+    label="$1"
+    min="$2"
+    max="$3"
+
+    while :; do
+        printf '%s (%s-%s): ' "$label" "$min" "$max"
+        IFS= read -r value || exit 1
+
+        case "$value" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]; then
+                    PROMPT_VALUE="$value"
+                    return 0
+                fi
+                ;;
+        esac
+
+        echo "Введите число от $min до $max."
+    done
+}
+
+prompt_required_text() {
+    label="$1"
+
+    while :; do
+        printf '%s: ' "$label"
+        IFS= read -r value || exit 1
+        if [ -n "$value" ]; then
+            PROMPT_VALUE="$value"
+            return 0
+        fi
+        echo "Поле не может быть пустым."
+    done
+}
+
+prompt_optional_text() {
+    label="$1"
+    printf '%s (Enter = пропустить): ' "$label"
+    IFS= read -r PROMPT_VALUE || exit 1
+}
+
+prompt_agent_choice() {
+    echo "Агент подписки:"
+    echo "  1. Happ/2.7.0"
+    echo "  2. v2rayNG/1.8.5"
+    echo "  3. INCY/2.0.9"
+
+    while :; do
+        printf 'Выберите агент (1-3): '
+        IFS= read -r value || exit 1
+        case "$value" in
+            1|Happ/2.7.0|happ|Happ)
+                PROMPT_VALUE="Happ/2.7.0"
+                return 0
+                ;;
+            2|v2rayNG/1.8.5|v2rayNG|v2rayng)
+                PROMPT_VALUE="v2rayNG/1.8.5"
+                return 0
+                ;;
+            3|INCY/2.0.9|incy|INCY)
+                PROMPT_VALUE="INCY/2.0.9"
+                return 0
+                ;;
+        esac
+        echo "Выберите 1, 2 или 3."
+    done
+}
+
+normalize_update_interval() {
+    case "$UPDATE_INTERVAL_HOURS" in
+        ''|*[!0-9]*) UPDATE_INTERVAL_HOURS="3" ;;
+        *)
+            if [ "$UPDATE_INTERVAL_HOURS" -lt 1 ] || [ "$UPDATE_INTERVAL_HOURS" -gt 12 ]; then
+                UPDATE_INTERVAL_HOURS="3"
+            fi
+            ;;
+    esac
+
+    CRON_SCHEDULE="0 */$UPDATE_INTERVAL_HOURS * * *"
+}
+
+load_config() {
+    [ -r "$CONFIG_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+    return 0
+}
+
+save_config() {
+    tmp_config="$(mktemp /tmp/podkop-update.conf.XXXXXX)" || return 1
+
+    {
+        echo "# Автоматически создано podkop-update"
+        printf 'SOURCE_1=%s\n' "$(shell_quote "$SOURCE_1")"
+        printf 'SOURCE_2=%s\n' "$(shell_quote "$SOURCE_2")"
+        printf 'SOURCE_3=%s\n' "$(shell_quote "$SOURCE_3")"
+        printf 'SUBSCRIPTION_USER_AGENT=%s\n' "$(shell_quote "$SUBSCRIPTION_USER_AGENT")"
+        printf 'X_DEVICE_OS=%s\n' "$(shell_quote "$X_DEVICE_OS")"
+        printf 'X_VER_OS=%s\n' "$(shell_quote "$X_VER_OS")"
+        printf 'X_DEVICE_MODEL=%s\n' "$(shell_quote "$X_DEVICE_MODEL")"
+        printf 'UPDATE_INTERVAL_HOURS=%s\n' "$(shell_quote "$UPDATE_INTERVAL_HOURS")"
+    } > "$tmp_config" || {
+        rm -f "$tmp_config"
+        return 1
+    }
+
+    chmod 600 "$tmp_config" 2>/dev/null
+    mv "$tmp_config" "$CONFIG_FILE"
+}
+
+run_setup_wizard() {
+    if [ ! -t 0 ]; then
+        log "❌ Нет интерактивного терминала. Запустите $0 --setup вручную по SSH."
+        exit 1
+    fi
+
+    echo "=== Мастер настройки podkop-update ==="
+
+    prompt_required_number "1. Сколько подписок" 1 3
+    source_count="$PROMPT_VALUE"
+
+    SOURCE_1=""
+    SOURCE_2=""
+    SOURCE_3=""
+
+    idx=1
+    while [ "$idx" -le "$source_count" ]; do
+        prompt_required_text "2.$idx Ссылка на подписку"
+        case "$idx" in
+            1) SOURCE_1="$PROMPT_VALUE" ;;
+            2) SOURCE_2="$PROMPT_VALUE" ;;
+            3) SOURCE_3="$PROMPT_VALUE" ;;
+        esac
+        idx=$((idx + 1))
+    done
+
+    prompt_agent_choice
+    SUBSCRIPTION_USER_AGENT="$PROMPT_VALUE"
+
+    prompt_optional_text "3. Операционная система"
+    X_DEVICE_OS="$PROMPT_VALUE"
+
+    prompt_optional_text "4. Версия ОС"
+    X_VER_OS="$PROMPT_VALUE"
+
+    prompt_optional_text "5. Модель девайса"
+    X_DEVICE_MODEL="$PROMPT_VALUE"
+
+    prompt_required_number "6. Авто-обновление подписки в часах" 1 12
+    UPDATE_INTERVAL_HOURS="$PROMPT_VALUE"
+
+    normalize_update_interval
+
+    save_config || {
+        log "❌ Не удалось сохранить конфиг в $CONFIG_FILE"
+        exit 1
+    }
+
+    log "✅ Настройки сохранены в $CONFIG_FILE"
+}
 
 # Ищем в тексте ссылки на поддерживаемые протоколы
 PATTERN='(vless|ss|trojan|socks|hy2)://[^"'"'"' <]+'
@@ -85,9 +265,30 @@ generate_hwid() {
     return 1
 }
 
+detect_openwrt_os() {
+    if [ -r /etc/openwrt_release ]; then
+        os_name=$(sed -n "s/^DISTRIB_ID=['\"]\\{0,1\\}\\([^'\"]*\\)['\"]\\{0,1\\}$/\\1/p" /etc/openwrt_release | sed -n '1p')
+        if [ -n "$os_name" ]; then
+            printf '%s\n' "$os_name"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "OpenWrt"
+}
+
 detect_openwrt_version() {
     if [ -r /etc/openwrt_release ]; then
         sed -n "s/^DISTRIB_RELEASE=['\"]\\{0,1\\}\\([^'\"]*\\)['\"]\\{0,1\\}$/\\1/p" /etc/openwrt_release | sed -n '1p'
+        return 0
+    fi
+
+    return 1
+}
+
+detect_openwrt_target() {
+    if [ -r /etc/openwrt_release ]; then
+        sed -n "s/^DISTRIB_TARGET=['\"]\\{0,1\\}\\([^'\"]*\\)['\"]\\{0,1\\}$/\\1/p" /etc/openwrt_release | sed -n '1p'
         return 0
     fi
 
@@ -100,8 +301,19 @@ detect_openwrt_model() {
         return 0
     fi
 
+    if [ -s /tmp/sysinfo/board_name ]; then
+        sed -n '1p' /tmp/sysinfo/board_name
+        return 0
+    fi
+
     if [ -r /proc/device-tree/model ]; then
         tr -d '\000' < /proc/device-tree/model
+        return 0
+    fi
+
+    target="$(detect_openwrt_target)"
+    if [ -n "$target" ]; then
+        printf '%s\n' "$target"
         return 0
     fi
 
@@ -138,7 +350,13 @@ ensure_hwid() {
 }
 
 ensure_device_headers() {
-    [ -n "$X_DEVICE_OS" ] || X_DEVICE_OS="$X_OS"
+    if [ -z "$X_DEVICE_OS" ]; then
+        if [ -n "$X_OS" ] && ! is_version_like "$X_OS"; then
+            X_DEVICE_OS="$X_OS"
+        else
+            X_DEVICE_OS="$(detect_openwrt_os)"
+        fi
+    fi
 
     if [ -z "$X_VER_OS" ]; then
         if is_version_like "$X_MODEL"; then
@@ -190,6 +408,33 @@ ensure_cron_job() {
 
     log "⏰ Cron обновлен: $CRON_SCHEDULE"
 }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --setup)
+            FORCE_SETUP="1"
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            log "❌ Неизвестный аргумент: $1"
+            print_usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+load_config >/dev/null 2>&1
+
+if [ "$FORCE_SETUP" = "1" ] || [ ! -s "$CONFIG_FILE" ]; then
+    run_setup_wizard
+fi
+
+load_config >/dev/null 2>&1
+normalize_update_interval
 
 # --- СКАЧИВАНИЕ ---
 # Загружает сырой текст/HTML/подписку
