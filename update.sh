@@ -67,8 +67,10 @@ log() { echo "[$(date '+%F %T')] $*" >&2; }
 TMP_PRIORITY="$(mktemp)"
 TMP_POOL="$(mktemp)"
 TMP_FINAL="$(mktemp)"
+TMP_WRITTEN="$(mktemp)"
+TMP_CURRENT="$(mktemp)"
 
-trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u"' EXIT INT TERM
+trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u"' EXIT INT TERM
 
 print_usage() {
     cat <<EOF
@@ -975,20 +977,6 @@ fi
 
 log "✨ Готово! Выбрано $TOTAL качественных серверов"
 
-# --- UCI ---
-# Сначала удаляем старые ключи
-uci -q delete podkop.main.urltest_proxy_links
-log "🧹 Старые ключи удалены из конфига"
-
-# Затем настраиваем Podkop
-log "⚙️  Настройка Podkop: включение URLTest и запись ключей..."
-uci set podkop.main.connection_type='proxy'
-uci set podkop.main.proxy_config_type='urltest'
-uci set podkop.main.urltest_check_interval='1m'
-uci set podkop.main.urltest_tolerance='150'
-uci set podkop.main.urltest_testing_url="$URLTEST_TESTING_URL"
-
-# Записываем список ключей в конфиг
 WRITTEN=0
 while read -r link; do
     [ -n "$link" ] || continue
@@ -1004,9 +992,54 @@ while read -r link; do
             esac
             ;;
     esac
-    uci add_list podkop.main.urltest_proxy_links="$link"
+    printf '%s\n' "$link" >> "$TMP_WRITTEN"
     WRITTEN=$((WRITTEN + 1))
 done < "$TMP_FINAL"
+
+# Если после финальной фильтрации не осталось валидных серверов — ничего не меняем
+if [ "$WRITTEN" -eq 0 ]; then
+    log "❌ После финальной проверки не осталось валидных серверов — ничего не меняем"
+    exit 0
+fi
+
+uci -q show podkop.main 2>/dev/null | \
+    sed -n "s/^podkop\.main\.urltest_proxy_links='\(.*\)'$/\1/p" > "$TMP_CURRENT"
+
+sort -u "$TMP_WRITTEN" > "${TMP_WRITTEN}.u" && mv "${TMP_WRITTEN}.u" "$TMP_WRITTEN"
+sort -u "$TMP_CURRENT" > "${TMP_CURRENT}.u" && mv "${TMP_CURRENT}.u" "$TMP_CURRENT"
+
+LINKS_CHANGED=0
+SETTINGS_CHANGED=0
+
+cmp -s "$TMP_WRITTEN" "$TMP_CURRENT" || LINKS_CHANGED=1
+[ "$(uci -q get podkop.main.connection_type)" = "proxy" ] || SETTINGS_CHANGED=1
+[ "$(uci -q get podkop.main.proxy_config_type)" = "urltest" ] || SETTINGS_CHANGED=1
+[ "$(uci -q get podkop.main.urltest_check_interval)" = "1m" ] || SETTINGS_CHANGED=1
+[ "$(uci -q get podkop.main.urltest_tolerance)" = "150" ] || SETTINGS_CHANGED=1
+[ "$(uci -q get podkop.main.urltest_testing_url)" = "$URLTEST_TESTING_URL" ] || SETTINGS_CHANGED=1
+
+if [ "$LINKS_CHANGED" -eq 0 ] && [ "$SETTINGS_CHANGED" -eq 0 ]; then
+    log "✅ Изменений в конфиге Podkop нет — перезапуск не требуется"
+    log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
+    exit 0
+fi
+
+# --- UCI ---
+log "🧹 Применение изменений в конфиг Podkop..."
+uci -q delete podkop.main.urltest_proxy_links
+
+# Затем настраиваем Podkop
+log "⚙️  Настройка Podkop: включение URLTest и запись ключей..."
+uci set podkop.main.connection_type='proxy'
+uci set podkop.main.proxy_config_type='urltest'
+uci set podkop.main.urltest_check_interval='1m'
+uci set podkop.main.urltest_tolerance='150'
+uci set podkop.main.urltest_testing_url="$URLTEST_TESTING_URL"
+
+while read -r link; do
+    [ -n "$link" ] || continue
+    uci add_list podkop.main.urltest_proxy_links="$link"
+done < "$TMP_WRITTEN"
 
 uci commit podkop
 
