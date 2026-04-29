@@ -56,7 +56,6 @@ UPDATE_CRON_COMMAND="/usr/bin/podkop-update --updates-only >> /var/log/podkop-up
 URLTEST_TESTING_URL="https://cp.cloudflare.com/generate_204"
 POST_RESTART_CHECK_ATTEMPTS="10"
 POST_RESTART_CHECK_DELAY="3"
-POST_RESTART_CHECK_TIMEOUT="10"
 
 # Сколько максимум ключей класть в Podkop
 LIMIT=27
@@ -667,25 +666,8 @@ check_servers_after_restart() {
         return 1
     fi
 
-    attempt=1
-    while [ "$attempt" -le "$POST_RESTART_CHECK_ATTEMPTS" ]; do
-        if wget \
-            --no-check-certificate \
-            --timeout="$POST_RESTART_CHECK_TIMEOUT" \
-            --tries=1 \
-            -qO /dev/null \
-            "$URLTEST_TESTING_URL" 2>/dev/null; then
-            log "✅ Проверка доступности серверов пройдена"
-            return 0
-        fi
-
-        log "⏳ Проверка доступности не пройдена, попытка $attempt/$POST_RESTART_CHECK_ATTEMPTS"
-        sleep "$POST_RESTART_CHECK_DELAY"
-        attempt=$((attempt + 1))
-    done
-
-    log "⚠️  Podkop запущен, но проверка доступности серверов не пройдена"
-    return 1
+    log "✅ Podkop запущен; дальнейшая проверка доступности выполняется встроенным URLTest"
+    return 0
 }
 
 while [ $# -gt 0 ]; do
