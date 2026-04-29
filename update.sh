@@ -1003,7 +1003,9 @@ if [ "$WRITTEN" -eq 0 ]; then
 fi
 
 uci -q show podkop.main 2>/dev/null | \
-    sed -n "s/^podkop\.main\.urltest_proxy_links='\(.*\)'$/\1/p" > "$TMP_CURRENT"
+    sed -n "s/^podkop\.main\.urltest_proxy_links=//p" | \
+    sed "s/' '/\\
+/g; s/^'//; s/'$//" > "$TMP_CURRENT"
 
 sort -u "$TMP_WRITTEN" > "${TMP_WRITTEN}.u" && mv "${TMP_WRITTEN}.u" "$TMP_WRITTEN"
 sort -u "$TMP_CURRENT" > "${TMP_CURRENT}.u" && mv "${TMP_CURRENT}.u" "$TMP_CURRENT"
