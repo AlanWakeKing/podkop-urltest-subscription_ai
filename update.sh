@@ -10,6 +10,15 @@ SOURCE_3=""
 CONFIG_FILE="/etc/podkop-update.conf"
 UPDATE_INTERVAL_HOURS="3"
 FORCE_SETUP="0"
+UPDATES_ONLY="0"
+AUTO_UPDATE_SCRIPT="1"
+AUTO_UPDATE_PODKOP="1"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh"
+PODKOP_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
+PODKOP_PACKAGE_CANDIDATES="luci-app-podkop podkop"
+PKG_MANAGER=""
+PKG_INDEXES_UPDATED="0"
+SCRIPT_SELF_PATH=""
 
 # User-Agent, который увидит сервер подписки.
 SUBSCRIPTION_USER_AGENT="v2rayNG/1.8.5"
@@ -39,6 +48,14 @@ AUTO_INSTALL_CRON="1"
 CRON_FILE="/etc/crontabs/root"
 CRON_SCHEDULE="0 */3 * * *"
 CRON_COMMAND="/usr/bin/podkop-update >> /var/log/podkop-update.log 2>&1"
+UPDATE_CRON_SCHEDULE="0 5 * * 1"
+UPDATE_CRON_COMMAND="/usr/bin/podkop-update --updates-only >> /var/log/podkop-update.log 2>&1"
+
+# URL для URLTest и последующей проверки доступности после перезапуска Podkop.
+URLTEST_TESTING_URL="https://cp.cloudflare.com/generate_204"
+POST_RESTART_CHECK_ATTEMPTS="10"
+POST_RESTART_CHECK_DELAY="3"
+POST_RESTART_CHECK_TIMEOUT="10"
 
 # Сколько максимум ключей класть в Podkop
 LIMIT=27
@@ -55,15 +72,26 @@ trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "${TMP_POOL}.rnd" "${TMP_PR
 print_usage() {
     cat <<EOF
 Использование:
-  $0 [--setup]
+  $0 [--setup|--updates-only]
 
 Опции:
-  --setup   Запустить мастер настройки и сохранить ответы в $CONFIG_FILE
+  --setup          Запустить мастер настройки и сохранить ответы в $CONFIG_FILE
+  --updates-only   Проверить и установить обновления podkop-update и Podkop, затем выйти
 EOF
 }
 
 shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+resolve_script_path() {
+    case "$0" in
+        /*) SCRIPT_SELF_PATH="$0" ;;
+        *)
+            SCRIPT_SELF_PATH="$(command -v "$0" 2>/dev/null)"
+            [ -n "$SCRIPT_SELF_PATH" ] || SCRIPT_SELF_PATH="$0"
+            ;;
+    esac
 }
 
 prompt_required_number() {
@@ -147,6 +175,195 @@ normalize_update_interval() {
     esac
 
     CRON_SCHEDULE="0 */$UPDATE_INTERVAL_HOURS * * *"
+}
+
+detect_package_manager() {
+    if [ -n "$PKG_MANAGER" ]; then
+        return 0
+    fi
+
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"
+        return 0
+    fi
+
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_package_indexes_updated() {
+    [ "$PKG_INDEXES_UPDATED" = "1" ] && return 0
+    detect_package_manager || return 1
+
+    case "$PKG_MANAGER" in
+        apk)
+            log "📦 Обновление индексов пакетов apk..."
+            apk update >/dev/null 2>&1 || return 1
+            ;;
+        opkg)
+            log "📦 Обновление индексов пакетов opkg..."
+            opkg update >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    PKG_INDEXES_UPDATED="1"
+    return 0
+}
+
+is_package_installed() {
+    pkg="$1"
+    detect_package_manager || return 1
+
+    case "$PKG_MANAGER" in
+        apk)
+            apk info -e "$pkg" >/dev/null 2>&1
+            ;;
+        opkg)
+            opkg status "$pkg" 2>/dev/null | grep -q '^Status: .* installed'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+upgrade_package_if_installed() {
+    pkg="$1"
+    is_package_installed "$pkg" || return 1
+    ensure_package_indexes_updated || return 1
+
+    case "$PKG_MANAGER" in
+        apk)
+            log "📦 Проверка обновления пакета $pkg..."
+            apk upgrade "$pkg" >/dev/null 2>&1 || return 1
+            ;;
+        opkg)
+            log "📦 Проверка обновления пакета $pkg..."
+            opkg upgrade "$pkg" >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+run_official_podkop_installer() {
+    action_label="$1"
+    [ -n "$PODKOP_INSTALL_SCRIPT_URL" ] || return 1
+
+    tmp_installer="$(mktemp /tmp/podkop-install.XXXXXX)" || return 1
+
+    if wget --no-check-certificate -qO "$tmp_installer" "$PODKOP_INSTALL_SCRIPT_URL" 2>/dev/null; then
+        if grep -q '^#!/' "$tmp_installer"; then
+            log "📦 $action_label Podkop через официальный install.sh..."
+            if sh "$tmp_installer" >/dev/null 2>&1; then
+                rm -f "$tmp_installer"
+                return 0
+            fi
+            log "⚠️  Официальный install.sh завершился с ошибкой"
+        else
+            log "⚠️  Получен некорректный install.sh для Podkop"
+        fi
+    else
+        log "⚠️  Не удалось скачать официальный install.sh для Podkop"
+    fi
+
+    rm -f "$tmp_installer"
+    return 1
+}
+
+ensure_podkop_installed() {
+    if [ -x /etc/init.d/podkop ]; then
+        return 0
+    fi
+
+    log "📦 Podkop не найден, пытаюсь установить..."
+
+    if run_official_podkop_installer "Установка"; then
+        if [ -x /etc/init.d/podkop ]; then
+            log "✅ Podkop установлен"
+            return 0
+        fi
+        log "⚠️  install.sh завершился без ошибки, но Podkop не найден после установки"
+    fi
+
+    log "❌ Не удалось установить Podkop"
+    return 1
+}
+
+ensure_podkop_updated() {
+    [ "$AUTO_UPDATE_PODKOP" = "1" ] || return 0
+    [ -x /etc/init.d/podkop ] || return 0
+
+    if run_official_podkop_installer "Проверка обновления"; then
+        log "✅ Проверка обновления Podkop через install.sh выполнена"
+        return 0
+    fi
+
+    log "⚠️  Перехожу к fallback через пакетный менеджер"
+
+    found_pkg="0"
+    for pkg in $PODKOP_PACKAGE_CANDIDATES; do
+        if is_package_installed "$pkg"; then
+            found_pkg="1"
+            if upgrade_package_if_installed "$pkg"; then
+                log "✅ Проверка обновления Podkop выполнена для пакета $pkg"
+            else
+                log "⚠️  Не удалось проверить или установить обновление для пакета $pkg"
+            fi
+        fi
+    done
+
+    if [ "$found_pkg" != "1" ]; then
+        log "ℹ️  Пакет Podkop не найден в списке: $PODKOP_PACKAGE_CANDIDATES"
+    fi
+}
+
+ensure_script_updated() {
+    [ "$AUTO_UPDATE_SCRIPT" = "1" ] || return 0
+    [ -n "$SCRIPT_UPDATE_URL" ] || return 0
+
+    resolve_script_path
+    [ -n "$SCRIPT_SELF_PATH" ] || return 0
+    [ -w "$SCRIPT_SELF_PATH" ] || return 0
+
+    tmp_script="$(mktemp /tmp/podkop-update.XXXXXX)" || return 1
+
+    if ! wget --no-check-certificate -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+        log "⚠️  Не удалось проверить обновление скрипта"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
+    if ! grep -q '^#!/bin/sh' "$tmp_script"; then
+        log "⚠️  Получен некорректный файл обновления скрипта"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
+    if cmp -s "$tmp_script" "$SCRIPT_SELF_PATH"; then
+        rm -f "$tmp_script"
+        return 0
+    fi
+
+    if mv "$tmp_script" "$SCRIPT_SELF_PATH"; then
+        chmod +x "$SCRIPT_SELF_PATH" 2>/dev/null
+        log "✅ Скрипт обновлен: $SCRIPT_SELF_PATH"
+        return 0
+    fi
+
+    log "⚠️  Не удалось установить обновление скрипта"
+    rm -f "$tmp_script"
+    return 1
 }
 
 load_config() {
@@ -379,8 +596,11 @@ ensure_cron_job() {
     [ "$AUTO_INSTALL_CRON" = "1" ] || return 0
 
     cron_line="${CRON_SCHEDULE} ${CRON_COMMAND}"
+    update_cron_line="${UPDATE_CRON_SCHEDULE} ${UPDATE_CRON_COMMAND}"
 
-    if [ -f "$CRON_FILE" ] && grep -Fxq "$cron_line" "$CRON_FILE"; then
+    if [ -f "$CRON_FILE" ] &&
+       grep -Fxq "$cron_line" "$CRON_FILE" &&
+       grep -Fxq "$update_cron_line" "$CRON_FILE"; then
         return 0
     fi
 
@@ -401,18 +621,67 @@ ensure_cron_job() {
         return 1
     }
 
+    printf '%s\n' "$update_cron_line" >> "$CRON_FILE" || {
+        log "⚠️  Не удалось записать cron-задачу обновления"
+        return 1
+    }
+
     /etc/init.d/cron restart >/dev/null 2>&1 || {
         log "⚠️  Не удалось перезапустить cron"
         return 1
     }
 
-    log "⏰ Cron обновлен: $CRON_SCHEDULE"
+    log "⏰ Cron обновлен: подписки '$CRON_SCHEDULE', обновления '$UPDATE_CRON_SCHEDULE'"
+}
+
+wait_for_podkop() {
+    attempt=1
+    while [ "$attempt" -le "$POST_RESTART_CHECK_ATTEMPTS" ]; do
+        if /etc/init.d/podkop status >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1; then
+            return 0
+        fi
+
+        sleep "$POST_RESTART_CHECK_DELAY"
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+check_servers_after_restart() {
+    if ! wait_for_podkop; then
+        log "❌ Podkop не поднялся после перезапуска"
+        return 1
+    fi
+
+    attempt=1
+    while [ "$attempt" -le "$POST_RESTART_CHECK_ATTEMPTS" ]; do
+        if wget \
+            --no-check-certificate \
+            --timeout="$POST_RESTART_CHECK_TIMEOUT" \
+            --tries=1 \
+            -qO /dev/null \
+            "$URLTEST_TESTING_URL" 2>/dev/null; then
+            log "✅ Проверка доступности серверов пройдена"
+            return 0
+        fi
+
+        log "⏳ Проверка доступности не пройдена, попытка $attempt/$POST_RESTART_CHECK_ATTEMPTS"
+        sleep "$POST_RESTART_CHECK_DELAY"
+        attempt=$((attempt + 1))
+    done
+
+    log "⚠️  Podkop запущен, но проверка доступности серверов не пройдена"
+    return 1
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --setup)
             FORCE_SETUP="1"
+            ;;
+        --updates-only)
+            UPDATES_ONLY="1"
             ;;
         -h|--help)
             print_usage
@@ -427,6 +696,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+ensure_podkop_installed || exit 1
+
 load_config >/dev/null 2>&1
 
 if [ "$FORCE_SETUP" = "1" ] || [ ! -s "$CONFIG_FILE" ]; then
@@ -435,6 +706,15 @@ fi
 
 load_config >/dev/null 2>&1
 normalize_update_interval
+
+if [ "$UPDATES_ONLY" = "1" ]; then
+    log "🔄 Проверка обновлений..."
+    ensure_script_updated
+    ensure_podkop_updated
+    ensure_cron_job
+    log "✅ Проверка обновлений завершена"
+    exit 0
+fi
 
 # --- СКАЧИВАНИЕ ---
 # Загружает сырой текст/HTML/подписку
@@ -695,7 +975,7 @@ uci set podkop.main.connection_type='proxy'
 uci set podkop.main.proxy_config_type='urltest'
 uci set podkop.main.urltest_check_interval='1m'
 uci set podkop.main.urltest_tolerance='150'
-uci set podkop.main.urltest_testing_url='https://cp.cloudflare.com/generate_204'
+uci set podkop.main.urltest_testing_url="$URLTEST_TESTING_URL"
 
 # Записываем список ключей в конфиг
 WRITTEN=0
@@ -721,6 +1001,12 @@ uci commit podkop
 
 # Перезапускаем сервис
 log "🔄 Перезапуск сервиса..."
-/etc/init.d/podkop restart
+/etc/init.d/podkop restart || {
+    log "❌ Не удалось перезапустить Podkop"
+    exit 1
+}
+
+log "🩺 Проверка доступности серверов..."
+check_servers_after_restart
 
 log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
