@@ -64,6 +64,16 @@ chmod +x /usr/bin/podkop-update
 ```
 Если всё прошло без ошибок, Podkop будет обновлён.
 
+Проверить версию скрипта:
+```bash
+/usr/bin/podkop-update --version
+```
+
+Проверить, доступно ли обновление скрипта:
+```bash
+/usr/bin/podkop-update --check-self-update
+```
+
 > [!IMPORTANT]
 > В админке могут быть ошибки, но Podkop с ними запустится.
 

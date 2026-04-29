@@ -4,6 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
+SCRIPT_VERSION="2026.04.29-1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -11,6 +12,7 @@ CONFIG_FILE="/etc/podkop-update.conf"
 UPDATE_INTERVAL_HOURS="3"
 FORCE_SETUP="0"
 UPDATES_ONLY="0"
+CHECK_SELF_UPDATE_ONLY="0"
 AUTO_UPDATE_SCRIPT="1"
 AUTO_UPDATE_PODKOP="1"
 PODKOP_INSTALL_AUTO_YES="1"
@@ -74,11 +76,13 @@ trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURREN
 print_usage() {
     cat <<EOF
 Использование:
-  $0 [--setup|--updates-only]
+  $0 [--setup|--updates-only|--check-self-update|--version]
 
 Опции:
   --setup          Запустить мастер настройки и сохранить ответы в $CONFIG_FILE
   --updates-only   Проверить и установить обновления podkop-update и Podkop, затем выйти
+  --check-self-update  Проверить наличие новой версии podkop-update и выйти
+  --version        Показать версию podkop-update и выйти
 EOF
 }
 
@@ -374,6 +378,44 @@ ensure_script_updated() {
     fi
 
     log "⚠️  Не удалось установить обновление скрипта"
+    rm -f "$tmp_script"
+    return 1
+}
+
+check_self_update() {
+    [ -n "$SCRIPT_UPDATE_URL" ] || {
+        log "⚠️  SCRIPT_UPDATE_URL не задан"
+        return 1
+    }
+
+    resolve_script_path
+    [ -n "$SCRIPT_SELF_PATH" ] || {
+        log "⚠️  Не удалось определить путь к текущему скрипту"
+        return 1
+    }
+
+    tmp_script="$(mktemp /tmp/podkop-update-check.XXXXXX)" || return 1
+
+    if ! wget --no-check-certificate -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+        log "❌ Не удалось скачать удалённую версию скрипта"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
+    remote_version=$(sed -n "s/^SCRIPT_VERSION=\"\\([^\"]*\\)\"$/\\1/p" "$tmp_script" | sed -n '1p')
+    [ -n "$remote_version" ] || remote_version="unknown"
+
+    if cmp -s "$tmp_script" "$SCRIPT_SELF_PATH"; then
+        echo "podkop-update: актуальная версия"
+        echo "local:  $SCRIPT_VERSION"
+        echo "remote: $remote_version"
+        rm -f "$tmp_script"
+        return 0
+    fi
+
+    echo "podkop-update: доступно обновление"
+    echo "local:  $SCRIPT_VERSION"
+    echo "remote: $remote_version"
     rm -f "$tmp_script"
     return 1
 }
@@ -678,6 +720,13 @@ while [ $# -gt 0 ]; do
         --updates-only)
             UPDATES_ONLY="1"
             ;;
+        --check-self-update)
+            CHECK_SELF_UPDATE_ONLY="1"
+            ;;
+        --version)
+            echo "$SCRIPT_VERSION"
+            exit 0
+            ;;
         -h|--help)
             print_usage
             exit 0
@@ -692,6 +741,11 @@ while [ $# -gt 0 ]; do
 done
 
 ensure_podkop_installed || exit 1
+
+if [ "$CHECK_SELF_UPDATE_ONLY" = "1" ]; then
+    check_self_update
+    exit $?
+fi
 
 load_config >/dev/null 2>&1
 
