@@ -1002,10 +1002,19 @@ if [ "$WRITTEN" -eq 0 ]; then
     exit 0
 fi
 
-uci -q show podkop.main 2>/dev/null | \
-    sed -n "s/^podkop\.main\.urltest_proxy_links=//p" | \
-    sed "s/' '/\\
-/g; s/^'//; s/'$//" > "$TMP_CURRENT"
+uci -q export podkop 2>/dev/null | awk '
+    $1 == "config" && $2 == "section" {
+        in_main = ($3 == "'\''main'\''")
+        next
+    }
+    in_main && $1 == "list" && $2 == "urltest_proxy_links" {
+        line = $0
+        sub(/^[[:space:]]*list urltest_proxy_links /, "", line)
+        sub(/^'\''/, "", line)
+        sub(/'\''$/, "", line)
+        print line
+    }
+' > "$TMP_CURRENT"
 
 sort -u "$TMP_WRITTEN" > "${TMP_WRITTEN}.u" && mv "${TMP_WRITTEN}.u" "$TMP_WRITTEN"
 sort -u "$TMP_CURRENT" > "${TMP_CURRENT}.u" && mv "${TMP_CURRENT}.u" "$TMP_CURRENT"
