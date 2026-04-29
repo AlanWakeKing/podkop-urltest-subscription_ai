@@ -13,6 +13,7 @@ FORCE_SETUP="0"
 UPDATES_ONLY="0"
 AUTO_UPDATE_SCRIPT="1"
 AUTO_UPDATE_PODKOP="1"
+PODKOP_INSTALL_AUTO_YES="1"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh"
 PODKOP_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
 PODKOP_PACKAGE_CANDIDATES="luci-app-podkop podkop"
@@ -265,7 +266,17 @@ run_official_podkop_installer() {
     if wget --no-check-certificate -qO "$tmp_installer" "$PODKOP_INSTALL_SCRIPT_URL" 2>/dev/null; then
         if grep -q '^#!/' "$tmp_installer"; then
             log "📦 $action_label Podkop через официальный install.sh..."
-            if sh "$tmp_installer" >/dev/null 2>&1; then
+            if [ "$PODKOP_INSTALL_AUTO_YES" = "1" ]; then
+                log "ℹ️  Автоответ на вопросы install.sh: yes"
+                yes | sh "$tmp_installer"
+            elif [ -t 0 ] && [ -t 1 ]; then
+                sh "$tmp_installer"
+            else
+                log "ℹ️  Нет интерактивного терминала, официальный install.sh пропущен"
+                rm -f "$tmp_installer"
+                return 1
+            fi
+            if [ $? -eq 0 ]; then
                 rm -f "$tmp_installer"
                 return 0
             fi
