@@ -262,13 +262,25 @@ upgrade_package_if_installed() {
     return 0
 }
 
+# Скачивает файл по URL в указанный путь; пробует wget, затем curl
+download_file() {
+    local url="$1" dest="$2"
+    if wget --no-check-certificate -qO "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLk -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+    fi
+    return 1
+}
+
 run_official_podkop_installer() {
     action_label="$1"
     [ -n "$PODKOP_INSTALL_SCRIPT_URL" ] || return 1
 
     tmp_installer="$(mktemp /tmp/podkop-install.XXXXXX)" || return 1
 
-    if wget --no-check-certificate -qO "$tmp_installer" "$PODKOP_INSTALL_SCRIPT_URL" 2>/dev/null; then
+    if download_file "$PODKOP_INSTALL_SCRIPT_URL" "$tmp_installer"; then
         if grep -q '^#!/' "$tmp_installer"; then
             log "📦 $action_label Podkop через официальный install.sh..."
             if [ "$PODKOP_INSTALL_AUTO_YES" = "1" ]; then
@@ -354,7 +366,7 @@ ensure_script_updated() {
 
     tmp_script="$(mktemp /tmp/podkop-update.XXXXXX)" || return 1
 
-    if ! wget --no-check-certificate -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+    if ! download_file "$SCRIPT_UPDATE_URL" "$tmp_script"; then
         log "⚠️  Не удалось проверить обновление скрипта"
         rm -f "$tmp_script"
         return 1
@@ -396,7 +408,7 @@ check_self_update() {
 
     tmp_script="$(mktemp /tmp/podkop-update-check.XXXXXX)" || return 1
 
-    if ! wget --no-check-certificate -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+    if ! download_file "$SCRIPT_UPDATE_URL" "$tmp_script"; then
         log "❌ Не удалось скачать удалённую версию скрипта"
         rm -f "$tmp_script"
         return 1
