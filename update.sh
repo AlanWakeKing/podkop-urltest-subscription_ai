@@ -65,13 +65,29 @@ LIMIT=27
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
+MAX_LOG_LINES=500
+LOG_FILE="/var/log/podkop-update.log"
+if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt "$MAX_LOG_LINES" ]; then
+    tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+fi
+
 TMP_PRIORITY="$(mktemp)"
 TMP_POOL="$(mktemp)"
 TMP_FINAL="$(mktemp)"
 TMP_WRITTEN="$(mktemp)"
 TMP_CURRENT="$(mktemp)"
 
-trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u"' EXIT INT TERM
+LOCK_FILE="/var/run/podkop-update.lock"
+if [ -f "$LOCK_FILE" ]; then
+    lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+        log "⚠️  Уже запущен (PID $lock_pid), выход"
+        exit 0
+    fi
+fi
+printf '%s\n' "$$" > "$LOCK_FILE"
+
+trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u" "$LOCK_FILE"' EXIT INT TERM
 
 print_usage() {
     cat <<EOF
@@ -782,8 +798,12 @@ fi
 download_content() {
     url="$1"
 
+    raw=""
+
+    # Пробуем wget с таймаутом
     set -- \
         --no-check-certificate \
+        --timeout=15 \
         --user-agent="$SUBSCRIPTION_USER_AGENT" \
         -qO-
 
@@ -795,10 +815,33 @@ download_content() {
     [ -n "$X_MODEL" ] && set -- "$@" --header="X-Model: $X_MODEL"
 
     raw=$(wget "$@" "$url" 2>/dev/null)
+
+    # Fallback на curl если wget не справился
+    if [ -z "$raw" ] && command -v curl >/dev/null 2>&1; then
+        raw=$(curl -fsSLk \
+            --max-time 15 \
+            --user-agent "$SUBSCRIPTION_USER_AGENT" \
+            ${X_HWID:+-H "X-HWID: $X_HWID"} \
+            ${X_DEVICE_OS:+-H "X-Device-OS: $X_DEVICE_OS"} \
+            ${X_VER_OS:+-H "X-Ver-OS: $X_VER_OS"} \
+            ${X_DEVICE_MODEL:+-H "X-Device-Model: $X_DEVICE_MODEL"} \
+            ${X_OS:+-H "X-OS: $X_OS"} \
+            ${X_MODEL:+-H "X-Model: $X_MODEL"} \
+            "$url" 2>/dev/null)
+    fi
+
     [ -n "$raw" ] || return 1
 
-    # Если контент base64 — декодируем, иначе возвращаем как есть
-    printf '%s' "$raw" | base64 -d 2>/dev/null || printf '%s' "$raw"
+    # Проверяем что строка похожа на base64 перед декодированием
+    if printf '%s' "$raw" | grep -qE '^[A-Za-z0-9+/=]{20,}$'; then
+        decoded=$(printf '%s' "$raw" | base64 -d 2>/dev/null)
+        if [ -n "$decoded" ]; then
+            printf '%s' "$decoded"
+            return 0
+        fi
+    fi
+
+    printf '%s' "$raw"
 }
 
 # --- НОРМАЛИЗАЦИЯ ССЫЛКИ ---
