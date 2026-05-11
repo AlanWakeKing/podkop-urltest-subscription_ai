@@ -1147,10 +1147,17 @@ uci commit podkop
 
 # Перезапускаем сервис
 log "🔄 Перезапуск сервиса..."
-/etc/init.d/podkop restart || {
-    log "❌ Не удалось перезапустить Podkop"
-    exit 1
-}
+rm -f /tmp/sing-box/cache.db 2>/dev/null
+if /etc/init.d/podkop reload 2>/dev/null; then
+    log "✅ Podkop перезагружен через reload"
+else
+    log "⚠️  reload не удался, пробую restart..."
+    rm -f /tmp/sing-box/cache.db 2>/dev/null
+    /etc/init.d/podkop restart || {
+        log "❌ Не удалось перезапустить Podkop"
+        exit 1
+    }
+fi
 
 log "🩺 Проверка доступности серверов..."
 check_servers_after_restart
