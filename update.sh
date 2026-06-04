@@ -529,7 +529,7 @@ run_setup_wizard() {
 }
 
 # Ищем в тексте ссылки на поддерживаемые протоколы
-PATTERN='(vless|ss|trojan|socks|hy2)://[^"'"'"' <]+'
+PATTERN='(vless|ss|trojan|socks|hy2|hysteria2)://[^"'"'"' <]+'
 
 # --- НОРМАЛИЗАЦИЯ ИМЕНИ ---
 # Убираем мусор из названия, но флаги и emoji не трогаем
@@ -860,7 +860,7 @@ normalize_link() {
 
     # Принимаем только поддерживаемые схемы
     case "$link" in
-        vless://*|ss://*|trojan://*|socks://*|hy2://*) ;;
+        vless://*|ss://*|trojan://*|socks://*|hy2://*|hysteria2://*) ;;
         *) return 1 ;;
     esac
 
@@ -874,7 +874,7 @@ normalize_link() {
 
     # Shadowsocks и Hysteria2 не трогаем: только имя при необходимости
     case "$base" in
-        ss://*|hy2://*)
+        ss://*|hy2://*|hysteria2://*)
             if [ -n "$name" ]; then
                 printf '%s#%s\n' "$base" "$(clean_name "$name")"
             else
@@ -995,7 +995,7 @@ collect() {
     [ -n "$input" ] || return 0
 
     case "$input" in
-        vless://*|ss://*|trojan://*|socks://*|hy2://*)
+        vless://*|ss://*|trojan://*|socks://*|hy2://*|hysteria2://*)
             norm=$(normalize_link "$input") || {
                 log "⚠️  Ссылка $num: прямой ключ отброшен"
                 return
