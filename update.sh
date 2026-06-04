@@ -60,7 +60,7 @@ POST_RESTART_CHECK_ATTEMPTS="10"
 POST_RESTART_CHECK_DELAY="3"
 
 # Сколько максимум ключей класть в Podkop
-LIMIT=27
+LIMIT=60
 # -----------------
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
