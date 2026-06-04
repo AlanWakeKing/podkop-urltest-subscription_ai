@@ -872,15 +872,17 @@ normalize_link() {
     # Неподдерживаемый транспорт сразу выкидываем
     printf '%s' "$base" | grep -qi 'type=xhttp' && return 1
 
-    # Shadowsocks почти не трогаем: только имя при необходимости
-    if printf '%s' "$base" | grep -q 'ss://'; then
-        if [ -n "$name" ]; then
-            printf '%s#%s\n' "$base" "$(clean_name "$name")"
-        else
-            printf '%s\n' "$base"
-        fi
-        return 0
-    fi
+    # Shadowsocks и Hysteria2 не трогаем: только имя при необходимости
+    case "$base" in
+        ss://*|hy2://*)
+            if [ -n "$name" ]; then
+                printf '%s#%s\n' "$base" "$(clean_name "$name")"
+            else
+                printf '%s\n' "$base"
+            fi
+            return 0
+            ;;
+    esac
 
     # Если query отсутствует, добавляем его для дальнейшей сборки
     case "$base" in
