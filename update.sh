@@ -951,7 +951,7 @@ normalize_link() {
 
     # TYPE
     # Берём только нормальное значение, без хвостов и мусора
-    transport=$(printf '%s' "$query" | sed -nE 's/(^|&)type=([A-Za-z0-9]+).*/\2/p')
+    transport=$(printf '%s' "&${query}" | grep -oE '&type=[A-Za-z0-9]*' | tail -n1 | cut -d= -f2)
     transport=$(printf '%s' "$transport" | tr -cd 'a-zA-Z0-9')
 
     case "$transport" in
