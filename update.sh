@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.06.04"
+SCRIPT_VERSION="2026.07.07"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -161,24 +161,24 @@ prompt_optional_text() {
 
 prompt_agent_choice() {
     echo "Агент подписки:"
-    echo "  1. Happ/2.7.0"
+    echo "  1. Happ/3.25.1"
     echo "  2. v2rayNG/1.8.5"
-    echo "  3. INCY/2.0.9"
+    echo "  3. INCY/3.3.0"
 
     while :; do
         printf 'Выберите агент (1-3): '
         IFS= read -r value || exit 1
         case "$value" in
-            1|Happ/2.7.0|happ|Happ)
-                PROMPT_VALUE="Happ/2.7.0"
+            1|Happ/3.25.1|happ|Happ)
+                PROMPT_VALUE="Happ/3.25.1"
                 return 0
                 ;;
             2|v2rayNG/1.8.5|v2rayNG|v2rayng)
                 PROMPT_VALUE="v2rayNG/1.8.5"
                 return 0
                 ;;
-            3|INCY/2.0.9|incy|INCY)
-                PROMPT_VALUE="INCY/2.0.9"
+            3|INCY/3.3.0|incy|INCY)
+                PROMPT_VALUE="INCY/3.3.0"
                 return 0
                 ;;
         esac
