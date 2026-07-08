@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.07.08"
+SCRIPT_VERSION="2026.07.08.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -51,7 +51,7 @@ AUTO_INSTALL_CRON="1"
 CRON_FILE="/etc/crontabs/root"
 CRON_SCHEDULE="0 */3 * * *"
 CRON_COMMAND="/usr/bin/podkop-update >> /var/log/podkop-update.log 2>&1"
-UPDATE_CRON_SCHEDULE="0 5 * * 1"
+UPDATE_CRON_SCHEDULE="0 * * * *"
 UPDATE_CRON_COMMAND="/usr/bin/podkop-update --updates-only >> /var/log/podkop-update.log 2>&1"
 
 # URL для URLTest и последующей проверки доступности после перезапуска Podkop.
