@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.07.07"
+SCRIPT_VERSION="2026.07.08"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
