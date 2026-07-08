@@ -278,6 +278,21 @@ upgrade_package_if_installed() {
     return 0
 }
 
+ensure_jq_installed() {
+    command -v jq >/dev/null 2>&1 && return 0
+    detect_package_manager || return 1
+    ensure_package_indexes_updated || return 1
+
+    log "📦 Установка jq (нужен для разбора JSON-подписки)..."
+    case "$PKG_MANAGER" in
+        apk) apk add jq >/dev/null 2>&1 ;;
+        opkg) opkg install jq >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+
+    command -v jq >/dev/null 2>&1
+}
+
 # Скачивает файл по URL в указанный путь; пробует wget, затем curl
 download_file() {
     local url="$1" dest="$2"
@@ -844,6 +859,58 @@ download_content() {
     printf '%s' "$raw"
 }
 
+# Некоторые подписки отдают не список ссылок, а Xray-конфиг (JSON-массив профилей).
+# Определяем это по первому непробельному символу.
+is_json_content() {
+    printf '%s' "$1" | grep -qE '^[[:space:]]*[][{]'
+}
+
+# Достаём из Xray JSON-профилей одиночные vless/hysteria и собираем из них обычные ссылки
+JQ_XRAY_FILTER='
+.[]
+| select(([.outbounds[].protocol] - ["freedom","blackhole"] | length) == 1)
+| . as $profile
+| ($profile.remarks // "") as $name
+| ($profile.outbounds[] | select(.protocol=="vless" or .protocol=="hysteria")) as $o
+| if $o.protocol == "vless" then
+    ($o.settings.vnext[0]) as $vn
+    | ($vn.users[0]) as $u
+    | ($o.streamSettings) as $ss
+    | ($ss.network // "tcp") as $net
+    | ($ss.security // "none") as $sec
+    | ($ss.realitySettings.serverName // $ss.tlsSettings.serverName // "") as $sni
+    | ($ss.realitySettings.fingerprint // $ss.tlsSettings.fingerprint // "") as $fp
+    | ($ss.realitySettings.publicKey // "") as $pbk
+    | ($ss.realitySettings.shortId // "") as $sid
+    | ($ss.grpcSettings.serviceName // "") as $svc
+    | ($u.flow // "") as $flow
+    | ($u.encryption // "none") as $enc
+    | "vless://\($u.id)@\($vn.address):\($vn.port)?encryption=\($enc)"
+      + (if $flow != "" then "&flow=\($flow)" else "" end)
+      + "&type=\($net)"
+      + (if $net == "grpc" then "&serviceName=\($svc)&mode=gun" else "" end)
+      + "&security=\($sec)"
+      + (if $sni != "" then "&sni=\($sni)" else "" end)
+      + (if $fp != "" then "&fp=\($fp)" else "" end)
+      + (if $pbk != "" then "&pbk=\($pbk)" else "" end)
+      + (if $sid != "" then "&sid=\($sid)" else "" end)
+      + "#\($name|@uri)"
+  else
+    ($o.settings) as $s
+    | ($o.streamSettings) as $ss
+    | ($ss.tlsSettings.serverName // "") as $sni
+    | ($ss.finalmask // {} | tostring) as $fm
+    | "hysteria2://\($ss.hysteriaSettings.auth)@\($s.address):\($s.port)/?sni=\($sni)"
+      + (if $fm != "{}" then "&fm=\($fm|@uri)" else "" end)
+      + "#\($name|@uri)"
+  end
+'
+
+convert_json_subscription() {
+    ensure_jq_installed || return 1
+    printf '%s' "$1" | jq -r "$JQ_XRAY_FILTER" 2>/dev/null
+}
+
 # --- НОРМАЛИЗАЦИЯ ССЫЛКИ ---
 # Приводит ссылку к виду, который понимает Podkop/sing-box
 normalize_link() {
@@ -1010,6 +1077,16 @@ collect() {
                 log "❌ Ссылка $num: ошибка загрузки"
                 return
             }
+
+            if is_json_content "$content"; then
+                converted=$(convert_json_subscription "$content")
+                if [ -n "$converted" ]; then
+                    content="$converted"
+                else
+                    log "❌ Ссылка $num: не удалось разобрать JSON-подписку (нужен jq)"
+                    return
+                fi
+            fi
 
             # Считаем найденные ключи до фильтрации
             count=$(printf '%s\n' "$content" | grep -oE "$PATTERN" | wc -l | tr -d ' ')
