@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.07.08.1"
+SCRIPT_VERSION="2026.10.27.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -61,6 +61,11 @@ POST_RESTART_CHECK_DELAY="3"
 
 # Сколько максимум ключей класть в Podkop
 LIMIT=60
+
+# Исключать серверы по имени (grep -E, ДО URL-декодирования — буквы/цифры как есть,
+# пробел/спецсимволы в %XX-виде). Группы, которые не должны попадать в Podkop:
+# EU Balanser WIFI #*, Moscow *, RU -> EU Balanser #*
+EXCLUDE_NAME_PATTERN='Balanser%20WIFI|Moscow|RU%20-%3E%20'
 # -----------------
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
@@ -868,10 +873,14 @@ is_json_content() {
 # Достаём из Xray JSON-профилей одиночные vless/hysteria и собираем из них обычные ссылки
 JQ_XRAY_FILTER='
 .[]
-| select(([.outbounds[].protocol] - ["freedom","blackhole"] | length) == 1)
+| select(([.outbounds[].protocol] - ["freedom","blackhole"] | length) >= 1)
 | . as $profile
-| ($profile.remarks // "") as $name
-| ($profile.outbounds[] | select(.protocol=="vless" or .protocol=="hysteria")) as $o
+| ($profile.remarks // "") as $base_name
+| ([$profile.outbounds[] | select(.protocol=="vless" or .protocol=="hysteria")]) as $matches
+| ($matches | length) as $match_count
+| (range(0; $match_count)) as $idx
+| ($matches[$idx]) as $o
+| ($base_name + (if $match_count > 1 then " (\($idx+1))" else "" end)) as $name
 | if $o.protocol == "vless" then
     ($o.settings.vnext[0]) as $vn
     | ($vn.users[0]) as $u
@@ -935,6 +944,11 @@ normalize_link() {
     base="${link%%#*}"
     name=""
     [ "$base" != "$link" ] && name="${link#*#}"
+
+    # Исключаем сервера по имени (см. EXCLUDE_NAME_PATTERN выше)
+    if [ -n "$name" ] && [ -n "$EXCLUDE_NAME_PATTERN" ]; then
+        printf '%s' "$name" | grep -qE "$EXCLUDE_NAME_PATTERN" && return 1
+    fi
 
     # Неподдерживаемый транспорт сразу выкидываем
     printf '%s' "$base" | grep -qi 'type=xhttp' && return 1
