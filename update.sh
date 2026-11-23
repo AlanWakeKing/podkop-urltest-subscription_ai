@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.10.27.1"
+SCRIPT_VERSION="2026.11.23.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -870,12 +870,20 @@ is_json_content() {
     printf '%s' "$1" | grep -qE '^[[:space:]]*[][{]'
 }
 
-# Достаём из Xray JSON-профилей одиночные vless/hysteria и собираем из них обычные ссылки
+# Each JSON row carries its authorized section separately from the share link.
+# OpenWrt jq is commonly compiled without the regex library: avoid sub/test/match.
 JQ_XRAY_FILTER='
-.[]
-| select(([.outbounds[].protocol] - ["freedom","blackhole"] | length) >= 1)
+if type == "array" then .[] elif type == "object" then . else empty end
+| select(type == "object" and (.outbounds | type) == "array")
 | . as $profile
 | ($profile.remarks // "") as $base_name
+| (if ($base_name | endswith("YOUTUBE NO ADS")) then "main"
+   elif ($base_name | endswith("Germany # 2") or endswith("Germany # 5") or endswith("Poland # 1")) then "Gemini"
+   elif (($base_name | startswith("🇳🇱 Netherlands #")) and
+         ((try ($base_name | split("#") | last | tonumber) catch null) != null)) then "AI"
+   elif ($base_name | endswith("AUTO-EU")) then "Other"
+   else "" end) as $section
+| select($section == "main" or $section == "Gemini" or $section == "AI" or $section == "Other")
 | ([$profile.outbounds[] | select(.protocol=="vless" or .protocol=="hysteria")]) as $matches
 | ($matches | length) as $match_count
 | (range(0; $match_count)) as $idx
@@ -894,10 +902,11 @@ JQ_XRAY_FILTER='
     | ($ss.grpcSettings.serviceName // "") as $svc
     | ($u.flow // "") as $flow
     | ($u.encryption // "none") as $enc
-    | "vless://\($u.id)@\($vn.address):\($vn.port)?encryption=\($enc)"
+    | "\($section)\tvless://\($u.id)@\($vn.address):\($vn.port)?encryption=\($enc)"
       + (if $flow != "" then "&flow=\($flow)" else "" end)
       + "&type=\($net)"
       + (if $net == "grpc" then "&serviceName=\($svc)&mode=gun" else "" end)
+      + (if $net == "xhttp" then "&path=\(($ss.xhttpSettings.path // "/")|@uri)&mode=\($ss.xhttpSettings.mode // "auto")" else "" end)
       + "&security=\($sec)"
       + (if $sni != "" then "&sni=\($sni)" else "" end)
       + (if $fp != "" then "&fp=\($fp)" else "" end)
@@ -909,7 +918,7 @@ JQ_XRAY_FILTER='
     | ($o.streamSettings) as $ss
     | ($ss.tlsSettings.serverName // "") as $sni
     | ($ss.finalmask // {} | tostring) as $fm
-    | "hysteria2://\($ss.hysteriaSettings.auth)@\($s.address):\($s.port)/?sni=\($sni)"
+    | "\($section)\thysteria2://\($ss.hysteriaSettings.auth)@\($s.address):\($s.port)/?sni=\($sni)"
       + (if $fm != "{}" then "&fm=\($fm|@uri)" else "" end)
       + "#\($name|@uri)"
   end
@@ -917,7 +926,7 @@ JQ_XRAY_FILTER='
 
 convert_json_subscription() {
     ensure_jq_installed || return 1
-    printf '%s' "$1" | jq -r "$JQ_XRAY_FILTER" 2>/dev/null
+    printf '%s' "$1" | jq -er "$JQ_XRAY_FILTER" 2>/dev/null
 }
 
 # --- НОРМАЛИЗАЦИЯ ССЫЛКИ ---
@@ -1066,193 +1075,214 @@ normalize_link() {
     fi
 }
 
-# --- СБОР ---
-# Если источник — прямая ссылка, кладём её в приоритет
-# Если источник — подписка/страница, скачиваем и парсим из неё все ключи
-collect() {
-    input="$1"
-    num="$2"
-
-    [ -n "$input" ] || return 0
-
-    case "$input" in
-        vless://*|ss://*|trojan://*|socks://*|hy2://*|hysteria2://*)
-            norm=$(normalize_link "$input") || {
-                log "⚠️  Ссылка $num: прямой ключ отброшен"
-                return
-            }
-            log "✅ Ссылка $num: добавлен прямой ключ (приоритет)"
-            printf '%s\n' "$norm" >> "$TMP_PRIORITY"
+# --- GROUPED COLLECTION ---
+# For text/base64 subscriptions authorize only exact, unsuffixed profile names.
+# JSON metadata is authoritative and is handled above, before names get (1)..(4).
+link_section() {
+    case "${1#*#}" in
+        *YOUTUBE%20NO%20ADS|*'YOUTUBE NO ADS') echo main ;;
+        *Germany%20%23%202|*Germany%20%23%205|*Poland%20%23%201|*'Germany # 2'|*'Germany # 5'|*'Poland # 1') echo Gemini ;;
+        *Netherlands%20%23[0-9]*|*'Netherlands #'[0-9]*)
+            number="${1#*#}"
+            case "$number" in
+                *Netherlands%20%23*) number="${number##*Netherlands%20%23}" ;;
+                *) number="${number##*Netherlands #}" ;;
+            esac
+            case "$number" in ''|*[!0-9]*) ;; *) echo AI ;; esac
             ;;
-
-        *)
-            log "📡 Ссылка $num: загрузка..."
-            content=$(download_content "$input") || {
-                log "❌ Ссылка $num: ошибка загрузки"
-                return
-            }
-
-            if is_json_content "$content"; then
-                converted=$(convert_json_subscription "$content")
-                if [ -n "$converted" ]; then
-                    content="$converted"
-                else
-                    log "❌ Ссылка $num: не удалось разобрать JSON-подписку (нужен jq)"
-                    return
-                fi
-            fi
-
-            # Считаем найденные ключи до фильтрации
-            count=$(printf '%s\n' "$content" | grep -oE "$PATTERN" | wc -l | tr -d ' ')
-            log "✅ Ссылка $num: найдено ключей: $count"
-
-            # Парсим каждый найденный ключ отдельно
-            printf '%s\n' "$content" | grep -oE "$PATTERN" | while read -r link; do
-                norm=$(normalize_link "$link") || continue
-                printf '%s\n' "$norm" >> "$TMP_POOL"
-            done
-            ;;
+        *AUTO-EU) echo Other ;;
     esac
 }
 
-# --- СТАРТ ---
-log "📥 Сбор ключей..."
-ensure_hwid
-ensure_device_headers
-ensure_cron_job
-collect "$SOURCE_1" "1"
-collect "$SOURCE_2" "2"
-collect "$SOURCE_3" "3"
-
-log "🔍 Фильтрация, исправление и выборка $LIMIT случайных ключей..."
-
-# Убираем дубли в приоритете и в пуле
-sort -u "$TMP_PRIORITY" > "${TMP_PRIORITY}.u" && mv "${TMP_PRIORITY}.u" "$TMP_PRIORITY"
-sort -u "$TMP_POOL" > "${TMP_POOL}.u" && mv "${TMP_POOL}.u" "$TMP_POOL"
-
-# Рандомизируем только пул
-if [ -s "$TMP_POOL" ]; then
-    awk 'BEGIN{srand()} {print rand() "\t" $0}' "$TMP_POOL" | sort -n | cut -f2- > "${TMP_POOL}.rnd"
-else
-    : > "${TMP_POOL}.rnd"
-fi
-
-# Сначала добавляем приоритетные прямые ключи
-cat "$TMP_PRIORITY" > "$TMP_FINAL"
-
-# Потом добираем случайными из пула до LIMIT
-while read -r link; do
-    [ -z "$link" ] && continue
-
-    count=$(wc -l < "$TMP_FINAL" | tr -d ' ')
-    [ "$count" -ge "$LIMIT" ] && break
-
-    grep -Fxq "$link" "$TMP_FINAL" && continue
-    printf '%s\n' "$link" >> "$TMP_FINAL"
-done < "${TMP_POOL}.rnd"
-
-TOTAL=$(wc -l < "$TMP_FINAL" | tr -d ' ')
-
-# Если ничего не осталось — ничего не меняем
-if [ "$TOTAL" -eq 0 ]; then
-    log "❌ Нет рабочих ключей — ничего не меняем"
-    exit 0
-fi
-
-log "✨ Готово! Выбрано $TOTAL качественных серверов"
-
-WRITTEN=0
-while read -r link; do
-    [ -n "$link" ] || continue
-    case "$link" in
-        *pbk=*)
-            fp=$(printf '%s' "$link" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
-            case "$fp" in
-                chrome|firefox|safari|ios|android|edge|360|random) ;;
-                *)
-                    log "⛔ Отброшен (fp='$fp'): $link"
-                    continue
-                    ;;
-            esac
+collect() {
+    local input="$1" num="$2" content converted row section link norm
+    [ -n "$input" ] || return 0
+    case "$input" in
+        vless://*|ss://*|trojan://*|socks://*|hy2://*|hysteria2://*)
+            section=$(link_section "$input")
+            [ -n "$section" ] || { log "⚠️  Source $num: unnamed/unauthorized direct link"; return 1; }
+            norm=$(normalize_link "$input") || return 1
+            printf '%s\t%s\n' "$section" "$norm" >> "$TMP_POOL"
+            return
             ;;
     esac
-    printf '%s\n' "$link" >> "$TMP_WRITTEN"
-    WRITTEN=$((WRITTEN + 1))
-done < "$TMP_FINAL"
+    log "📡 Source $num: downloading..."
+    content=$(download_content "$input") || { log "❌ Source $num: download failed"; return 1; }
+    if is_json_content "$content"; then
+        converted=$(convert_json_subscription "$content") || { log "❌ Source $num: invalid JSON/profile"; return 1; }
+        [ -n "$converted" ] || return 1
+        while IFS="$(printf '\t')" read -r section link; do
+            case "$section" in main|Gemini|AI|Other) ;; *) continue ;; esac
+            norm=$(normalize_link "$link") || continue
+            printf '%s\t%s\n' "$section" "$norm" >> "$TMP_POOL"
+        done <<EOF
+$converted
+EOF
+    else
+        # A text/HTML/base64 format has no reliable profile metadata; only names
+        # with an exact authorized suffix may enter a section.
+        printf '%s\n' "$content" | grep -oE "$PATTERN" | while IFS= read -r link; do
+            section=$(link_section "$link")
+            [ -n "$section" ] || continue
+            norm=$(normalize_link "$link") || continue
+            printf '%s\t%s\n' "$section" "$norm" >> "$TMP_POOL"
+        done
+    fi
+}
 
-# Если после финальной фильтрации не осталось валидных серверов — ничего не меняем
-if [ "$WRITTEN" -eq 0 ]; then
-    log "❌ После финальной проверки не осталось валидных серверов — ничего не меняем"
+# Append unique list values, retaining any pre-existing user choices in Other.
+add_list_once() {
+    local target="$1" value="$2" current
+    current=$(uci -q get "$target" 2>/dev/null || :)
+    case " $current " in *" $value "*) return 0 ;; esac
+    uci add_list "$target=$value"
+}
+
+# Move only routing selectors that were on main. Never mutate Gemini's google_ai
+# or delete selectors belonging to any unrelated section.
+migrate_main_routes() {
+    local key value item
+    for key in community_lists user_domains user_subnets local_domain_lists local_subnet_lists remote_domain_lists remote_subnet_lists fully_routed_ips; do
+        value=$(uci -q get "podkop.main.$key" 2>/dev/null || :)
+        for item in $value; do
+            [ "$key" = community_lists ] && [ "$item" = youtube ] && continue
+            [ "$key" = user_domains ] && [ "$item" = www.googleapis.com ] && continue
+            add_list_once "podkop.Other.$key" "$item" || return 1
+        done
+        [ -z "$value" ] || uci -q delete "podkop.main.$key" || return 1
+    done
+    for key in user_domain_list_type user_subnet_list_type user_domains_text user_subnets_text; do
+        value=$(uci -q get "podkop.main.$key" 2>/dev/null || :)
+        [ -z "$value" ] && continue
+        if [ -n "$(uci -q get "podkop.Other.$key" 2>/dev/null)" ] &&
+           [ "$(uci -q get "podkop.Other.$key")" != "$value" ]; then
+            log "❌ Conflicting Other.$key; refusing migration"
+            return 1
+        fi
+        uci set "podkop.Other.$key=$value" || return 1
+        uci -q delete "podkop.main.$key" || return 1
+    done
+    add_list_once podkop.main.community_lists youtube
+}
+
+# Replaces only the four explicitly managed sections' proxy pools. A missing
+# authorized pool fails before any UCI changes (no partial subscription update).
+set_proxy_pool() {
+    local section="$1" link
+    uci set "podkop.$section.connection_type=proxy" || return 1
+    uci set "podkop.$section.proxy_config_type=urltest" || return 1
+    uci set "podkop.$section.urltest_check_interval=1m" || return 1
+    uci set "podkop.$section.urltest_tolerance=150" || return 1
+    uci set "podkop.$section.urltest_testing_url=$URLTEST_TESTING_URL" || return 1
+    uci -q delete "podkop.$section.urltest_proxy_links" || :
+    while IFS= read -r link; do
+        [ -n "$link" ] || continue
+        uci add_list "podkop.$section.urltest_proxy_links=$link" || return 1
+    done < "$TMP_CURRENT"
+}
+
+rollback_podkop() {
+    log "❌ Update failed, restoring Podkop backup $BACKUP_FILE"
+    if [ -s "${BACKUP_FILE}.config" ]; then
+        cp "${BACKUP_FILE}.config" /etc/config/podkop || return 1
+        uci -q revert podkop || :
+    else
+        uci -q revert podkop || :
+        uci -q import podkop < "$BACKUP_FILE" || return 1
+        uci commit podkop || return 1
+    fi
+    /etc/init.d/podkop restart >/dev/null 2>&1 || log "❌ Restore requires manual service restart"
+}
+
+log "📥 Collecting authorized profiles..."
+ensure_hwid || exit 1
+ensure_device_headers
+ensure_cron_job
+collect "$SOURCE_1" 1 || exit 1
+collect "$SOURCE_2" 2 || exit 1
+collect "$SOURCE_3" 3 || exit 1
+
+# Deterministic idempotence: sort, dedupe and limit each section independently.
+sort -u "$TMP_POOL" > "${TMP_POOL}.u" || exit 1
+mv "${TMP_POOL}.u" "$TMP_POOL" || exit 1
+for section in main Gemini AI Other; do
+    awk -F '\t' -v section="$section" '$1==section {print $2}' "$TMP_POOL" | sed -n "1,${LIMIT}p" > "$TMP_CURRENT"
+    [ -s "$TMP_CURRENT" ] || { log "❌ No supported links for $section; unchanged"; exit 1; }
+    # Filter every pool before modifying any UCI section.
+    while IFS= read -r link; do
+        case "$link" in
+            *pbk=*)
+                fp=$(printf '%s' "$link" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
+                is_valid_fp "$fp" || { log "❌ Invalid fingerprint in $section"; exit 1; }
+                ;;
+        esac
+    done < "$TMP_CURRENT"
+    sed "s/^/$section$(printf '\t')/" "$TMP_CURRENT" >> "$TMP_FINAL"
+done
+
+# Backup before staging, persist it for manual recovery. Export is also used
+# as the exact idempotence comparison; never log credentials.
+BACKUP_FILE="/etc/podkop-update-backup-$(date '+%Y%m%d-%H%M%S')-$$"
+umask 077
+uci -q export podkop > "$BACKUP_FILE" || { rm -f "$BACKUP_FILE"; exit 1; }
+cp /etc/config/podkop "${BACKUP_FILE}.config" || { rm -f "$BACKUP_FILE"; exit 1; }
+
+apply_sections() {
+    local section link domain
+    for section in main Gemini AI Other; do
+        if ! uci -q get "podkop.$section" >/dev/null 2>&1; then
+            # UCI get section may not return the type on all versions; check show.
+            uci -q show "podkop.$section" >/dev/null 2>&1 || uci set "podkop.$section=section" || return 1
+        fi
+    done
+    migrate_main_routes || return 1
+    uci set podkop.main.user_domain_list_type=dynamic || return 1
+    add_list_once podkop.main.user_domains www.googleapis.com || return 1
+    add_list_once podkop.Gemini.community_lists google_ai || return 1
+    # Static core OpenAI/Claude domains supplement the versioned official
+    # sing-geosite rule sets below and keep login/API hosts available.
+    case "$(uci -q get podkop.AI.user_domain_list_type 2>/dev/null)" in
+        ''|dynamic) ;;
+        *) log "❌ AI user-domain type conflicts with dynamic list"; return 1 ;;
+    esac
+    uci set podkop.AI.user_domain_list_type=dynamic || return 1
+    for domain in openai.com chatgpt.com oaistatic.com oaiusercontent.com api.openai.com anthropic.com claude.ai api.anthropic.com claudeusercontent.com; do
+        add_list_once podkop.AI.user_domains "$domain" || return 1
+    done
+    # Official sing-box geosite rulesets are maintained independently and
+    # refreshed by Podkop's settings.update_interval; static domains remain
+    # as a fallback if an upstream list omits a necessary login/API host.
+    add_list_once podkop.AI.remote_domain_lists 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs' || return 1
+    add_list_once podkop.AI.remote_domain_lists 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-anthropic.srs' || return 1
+    for section in main Gemini AI Other; do
+        awk -F '\t' -v section="$section" '$1==section {print $2}' "$TMP_FINAL" > "$TMP_CURRENT"
+        set_proxy_pool "$section" || return 1
+    done
+}
+
+if ! apply_sections || ! uci -q export podkop > "$TMP_WRITTEN"; then
+    rollback_podkop
+    exit 1
+fi
+if cmp -s "$BACKUP_FILE" "$TMP_WRITTEN"; then
+    uci -q revert podkop || :
+    rm -f "$BACKUP_FILE" "${BACKUP_FILE}.config"
+    log "✅ No Podkop changes; restart unnecessary"
     exit 0
 fi
-
-uci -q export podkop 2>/dev/null | awk '
-    $1 == "config" && $2 == "section" {
-        in_main = ($3 == "'\''main'\''")
-        next
-    }
-    in_main && $1 == "list" && $2 == "urltest_proxy_links" {
-        line = $0
-        sub(/^[[:space:]]*list urltest_proxy_links /, "", line)
-        sub(/^'\''/, "", line)
-        sub(/'\''$/, "", line)
-        print line
-    }
-' > "$TMP_CURRENT"
-
-sort -u "$TMP_WRITTEN" > "${TMP_WRITTEN}.u" && mv "${TMP_WRITTEN}.u" "$TMP_WRITTEN"
-sort -u "$TMP_CURRENT" > "${TMP_CURRENT}.u" && mv "${TMP_CURRENT}.u" "$TMP_CURRENT"
-
-LINKS_CHANGED=0
-SETTINGS_CHANGED=0
-
-cmp -s "$TMP_WRITTEN" "$TMP_CURRENT" || LINKS_CHANGED=1
-[ "$(uci -q get podkop.main.connection_type)" = "proxy" ] || SETTINGS_CHANGED=1
-[ "$(uci -q get podkop.main.proxy_config_type)" = "urltest" ] || SETTINGS_CHANGED=1
-[ "$(uci -q get podkop.main.urltest_check_interval)" = "1m" ] || SETTINGS_CHANGED=1
-[ "$(uci -q get podkop.main.urltest_tolerance)" = "150" ] || SETTINGS_CHANGED=1
-[ "$(uci -q get podkop.main.urltest_testing_url)" = "$URLTEST_TESTING_URL" ] || SETTINGS_CHANGED=1
-
-if [ "$LINKS_CHANGED" -eq 0 ] && [ "$SETTINGS_CHANGED" -eq 0 ]; then
-    log "✅ Изменений в конфиге Podkop нет — перезапуск не требуется"
-    log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
-    exit 0
+if ! uci commit podkop; then
+    rollback_podkop
+    exit 1
 fi
-
-# --- UCI ---
-log "🧹 Применение изменений в конфиг Podkop..."
-uci -q delete podkop.main.urltest_proxy_links
-
-# Затем настраиваем Podkop
-log "⚙️  Настройка Podkop: включение URLTest и запись ключей..."
-uci set podkop.main.connection_type='proxy'
-uci set podkop.main.proxy_config_type='urltest'
-uci set podkop.main.urltest_check_interval='1m'
-uci set podkop.main.urltest_tolerance='150'
-uci set podkop.main.urltest_testing_url="$URLTEST_TESTING_URL"
-
-while read -r link; do
-    [ -n "$link" ] || continue
-    uci add_list podkop.main.urltest_proxy_links="$link"
-done < "$TMP_WRITTEN"
-
-uci commit podkop
-
-# Перезапускаем сервис
-log "🔄 Перезапуск сервиса..."
-rm -f /tmp/sing-box/cache.db 2>/dev/null
-if /etc/init.d/podkop reload 2>/dev/null; then
-    log "✅ Podkop перезагружен через reload"
-else
-    log "⚠️  reload не удался, пробую restart..."
-    rm -f /tmp/sing-box/cache.db 2>/dev/null
-    /etc/init.d/podkop restart || {
-        log "❌ Не удалось перезапустить Podkop"
+log "🔄 Reloading Podkop..."
+if ! /etc/init.d/podkop reload >/dev/null 2>&1; then
+    if ! /etc/init.d/podkop restart >/dev/null 2>&1; then
+        rollback_podkop
         exit 1
-    }
+    fi
 fi
-
-log "🩺 Проверка доступности серверов..."
-check_servers_after_restart
-
-log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
+if ! check_servers_after_restart; then
+    rollback_podkop
+    exit 1
+fi
+log "✅ Updated main, Gemini, AI, Other; backup: $BACKUP_FILE"
