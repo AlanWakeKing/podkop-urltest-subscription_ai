@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.24.3"
+SCRIPT_VERSION="2026.11.24.4"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -19,7 +19,7 @@ AUTO_UPDATE_SING_BOX="1"
 # Pinned build verified against Podkop 0.7.24 and current REALITY nodes.
 TESTED_ENGINE_VERSION="1.14.4-r28"
 PODKOP_INSTALL_AUTO_YES="1"
-SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/canary-singbox-r28/update.sh"
 PODKOP_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
 PODKOP_PACKAGE_CANDIDATES="luci-app-podkop podkop"
 PKG_MANAGER=""
@@ -567,6 +567,25 @@ restore_stock_sing_box() {
 
 # Only the tested, pinned podkop-engine build fixes the REALITY regression.
 # Stock 'sing-box' may be numerically newer but still lack that patch.
+detect_opkg_engine_arch() {
+    opkg print-architecture | awk '
+        $1 == "arch" {
+            arch = $2
+            priority = $3
+        }
+        $1 != "arch" {
+            arch = $1
+            priority = $2
+        }
+        priority ~ /^[0-9]+$/ && arch != "all" && arch != "noarch" &&
+            priority + 0 > best_priority {
+            selected = arch
+            best_priority = priority + 0
+        }
+        END { if (selected != "") print selected }
+    '
+}
+
 ensure_sing_box_updated() {
     [ "$AUTO_UPDATE_SING_BOX" = "1" ] || return 0
     detect_package_manager || return 1
@@ -611,7 +630,7 @@ ensure_sing_box_updated() {
     command -v curl >/dev/null 2>&1 || { log "❌ sing-box: curl required for verified download; unchanged"; return 1; }
     ensure_jq_installed || { log "❌ sing-box: jq unavailable; unchanged"; return 1; }
 
-    engine_arch=$(opkg print-architecture | awk 'END {print $2}')
+    engine_arch=$(detect_opkg_engine_arch)
     case "$engine_arch" in
         ''|all|noarch|*[!a-zA-Z0-9_-]*)
             log "❌ sing-box: unsupported package architecture; unchanged"
