@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.24.1"
+SCRIPT_VERSION="2026.11.24.2"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -86,6 +86,9 @@ TMP_WRITTEN="$(mktemp)"
 TMP_CURRENT="$(mktemp)"
 TMP_ENGINE_DIR=""
 ENGINE_SWITCH_ACTIVE="0"
+ENGINE_ORIGIN=""
+UNOWNED_BACKUP_DIR="/etc/podkop-update-sing-box-backup"
+UNOWNED_BACKUP_STAGING=""
 
 LOCK_FILE="/var/run/podkop-update.lock"
 if [ -f "$LOCK_FILE" ]; then
@@ -98,15 +101,17 @@ fi
 printf '%s\n' "$$" > "$LOCK_FILE"
 
 cleanup_update() {
-    trap - INT TERM
+    # A second TERM during emergency rollback must not abort recovery.
+    trap '' INT TERM
     if [ "$ENGINE_SWITCH_ACTIVE" = "1" ]; then
         ENGINE_SWITCH_ACTIVE="0"
         log "❌ sing-box: interrupted during package switch; attempting rollback"
-        restore_stock_sing_box
+        restore_previous_sing_box
     fi
     rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" \
         "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u" "$LOCK_FILE"
     [ -z "$TMP_ENGINE_DIR" ] || rm -rf "$TMP_ENGINE_DIR"
+    [ -z "$UNOWNED_BACKUP_STAGING" ] || rm -rf "$UNOWNED_BACKUP_STAGING"
 }
 trap 'cleanup_update' EXIT
 trap 'exit 143' INT TERM
@@ -423,6 +428,121 @@ wait_for_engine_health() {
     return 1
 }
 
+# An unowned binary has no opkg package to reinstall. Keep a persistent,
+# private copy across reboot before allowing a package to claim its paths.
+backup_unowned_sing_box() {
+    if [ -e "$UNOWNED_BACKUP_DIR" ]; then
+        log "❌ sing-box: existing unowned backup needs manual review; unchanged"
+        return 1
+    fi
+    umask 077
+    UNOWNED_BACKUP_STAGING=$(mktemp -d /etc/podkop-update-sing-box-backup.XXXXXX) || return 1
+    source_hash=$(sha256sum /usr/bin/sing-box 2>/dev/null) || {
+        log "❌ sing-box: cannot hash original binary; unchanged"
+        return 1
+    }
+    source_hash=${source_hash%% *}
+    if [ "${#source_hash}" -ne 64 ] || printf '%s' "$source_hash" | grep -q '[^0-9a-f]'; then
+        log "❌ sing-box: invalid original binary hash; unchanged"
+        return 1
+    fi
+    if ! gzip -c /usr/bin/sing-box > "$UNOWNED_BACKUP_STAGING/sing-box.gz"; then
+        log "❌ sing-box: unable to back up unowned binary; unchanged"
+        return 1
+    fi
+    backup_hash=$(gzip -dc "$UNOWNED_BACKUP_STAGING/sing-box.gz" | sha256sum | cut -d ' ' -f1)
+    if ! gzip -t "$UNOWNED_BACKUP_STAGING/sing-box.gz" 2>/dev/null ||
+        [ "$backup_hash" != "$source_hash" ]; then
+        log "❌ sing-box: original binary backup failed verification; unchanged"
+        return 1
+    fi
+    printf '%s\n' "$source_hash" > "$UNOWNED_BACKUP_STAGING/sha256"
+    [ ! -f /etc/init.d/sing-box ] || cp -p /etc/init.d/sing-box "$UNOWNED_BACKUP_STAGING/sing-box.init" || return 1
+    [ ! -f /etc/config/sing-box ] || cp -p /etc/config/sing-box "$UNOWNED_BACKUP_STAGING/sing-box.uci" || return 1
+    [ ! -f /etc/sing-box/config.json ] || cp -p /etc/sing-box/config.json "$UNOWNED_BACKUP_STAGING/config.json" || return 1
+    backup_free_kb=$(df -Pk /overlay | awk 'NR==2 {print $4}')
+    if [ -z "$backup_free_kb" ] || [ "$backup_free_kb" -lt 12000 ]; then
+        log "❌ sing-box: insufficient overlay space after persistent backup; unchanged"
+        return 1
+    fi
+    if ! mv "$UNOWNED_BACKUP_STAGING" "$UNOWNED_BACKUP_DIR"; then
+        log "❌ sing-box: cannot finalize persistent backup; unchanged"
+        return 1
+    fi
+    UNOWNED_BACKUP_STAGING=""
+    log "🔒 Original unowned sing-box saved to $UNOWNED_BACKUP_DIR"
+    return 0
+}
+
+restore_unowned_sing_box() {
+    service podkop stop >/dev/null 2>&1
+    installed_now=$(opkg list-installed 2>/dev/null) || {
+        log "❌ CRITICAL: cannot read opkg database during rollback"
+        return 1
+    }
+    if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+        if ! opkg remove --force-depends podkop-engine >/dev/null 2>&1; then
+            log "❌ CRITICAL: cannot remove podkop-engine during rollback"
+            return 1
+        fi
+    fi
+    installed_now=$(opkg list-installed 2>/dev/null) || return 1
+    if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+        log "❌ CRITICAL: podkop-engine still registered; original binary not restored over owned path"
+        return 1
+    fi
+    if [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.gz" ] || [ ! -f "$UNOWNED_BACKUP_DIR/sha256" ]; then
+        log "❌ CRITICAL: unowned binary backup missing"
+        return 1
+    fi
+    expected_old_hash=$(cat "$UNOWNED_BACKUP_DIR/sha256")
+    # Verify the compressed backup before touching the executable. Streaming
+    # avoids filling OpenWrt's small /tmp during an emergency rollback.
+    actual_old_hash=$(gzip -dc "$UNOWNED_BACKUP_DIR/sing-box.gz" | sha256sum | cut -d ' ' -f1)
+    if ! gzip -t "$UNOWNED_BACKUP_DIR/sing-box.gz" 2>/dev/null ||
+        [ "$expected_old_hash" != "$actual_old_hash" ]; then
+        log "❌ CRITICAL: original binary backup failed checksum verification"
+        return 1
+    fi
+    current_old_hash=$(sha256sum /usr/bin/sing-box 2>/dev/null | cut -d ' ' -f1)
+    if [ "$current_old_hash" != "$expected_old_hash" ]; then
+        if ! gzip -dc "$UNOWNED_BACKUP_DIR/sing-box.gz" > /usr/bin/sing-box ||
+            ! chmod 755 /usr/bin/sing-box ||
+            [ "$(sha256sum /usr/bin/sing-box | cut -d ' ' -f1)" != "$expected_old_hash" ]; then
+            log "❌ CRITICAL: cannot restore original binary"
+            return 1
+        fi
+    fi
+    [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.init" ] || cp -p "$UNOWNED_BACKUP_DIR/sing-box.init" /etc/init.d/sing-box || return 1
+    [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.uci" ] || cp -p "$UNOWNED_BACKUP_DIR/sing-box.uci" /etc/config/sing-box || return 1
+    [ ! -f "$UNOWNED_BACKUP_DIR/config.json" ] || cp -p "$UNOWNED_BACKUP_DIR/config.json" /etc/sing-box/config.json || return 1
+    service podkop start >/dev/null 2>&1
+    if wait_for_engine_health; then
+        log "⚠️  Original unowned sing-box restored and running"
+        return 0
+    fi
+    log "❌ CRITICAL: original binary restored but Podkop failed to start"
+    return 1
+}
+
+restore_previous_sing_box() {
+    case "$ENGINE_ORIGIN" in
+        stock) restore_stock_sing_box && return 0 ;;
+        unowned) restore_unowned_sing_box && return 0 ;;
+        *) log "❌ CRITICAL: unknown original sing-box package" ;;
+    esac
+    service podkop stop >/dev/null 2>&1
+    log "⚠️  Podkop stopped to restore ordinary DNS; manual recovery required"
+    return 1
+}
+
+rollback_engine_once() {
+    trap '' INT TERM
+    restore_previous_sing_box
+    ENGINE_SWITCH_ACTIVE="0"
+    trap 'exit 143' INT TERM
+}
+
 # Restore the pre-downloaded stock package after a failed engine switch.
 restore_stock_sing_box() {
     service podkop stop >/dev/null 2>&1
@@ -467,8 +587,23 @@ ensure_sing_box_updated() {
         fi
         return 0
     fi
-    if ! is_package_installed sing-box; then
-        log "⚠️  sing-box: unknown package; unchanged"
+    binary_owner=$(opkg search /usr/bin/sing-box 2>/dev/null) || {
+        log "❌ sing-box: ownership lookup failed; unchanged"
+        return 1
+    }
+    init_owner=$(opkg search /etc/init.d/sing-box 2>/dev/null) || {
+        log "❌ sing-box: init-script ownership lookup failed; unchanged"
+        return 1
+    }
+    if is_package_installed sing-box; then
+        ENGINE_ORIGIN="stock"
+    elif [ -x /usr/bin/sing-box ] && [ -x /etc/init.d/sing-box ] &&
+        [ -z "$binary_owner" ] && [ -z "$init_owner" ] &&
+        ! sing-box version | grep -q -- '-pdk-r'; then
+        ENGINE_ORIGIN="unowned"
+        log "ℹ️  sing-box binary and init script are unowned by opkg; persistent backup required"
+    else
+        log "⚠️  sing-box: unknown package/owner; unchanged"
         return 0
     fi
     command -v curl >/dev/null 2>&1 || { log "❌ sing-box: curl required for verified download; unchanged"; return 1; }
@@ -510,6 +645,13 @@ ensure_sing_box_updated() {
         log "❌ sing-box: package SHA256 mismatch; unchanged"
         return 1
     }
+    # The package and extracted executable coexist in tmpfs. Leave enough
+    # headroom for the tested build and the router's other temporary files.
+    engine_tmp_free_kb=$(df -Pk /tmp | awk 'NR==2 {print $4}')
+    if [ -z "$engine_tmp_free_kb" ] || [ "$engine_tmp_free_kb" -lt 35000 ]; then
+        log "❌ sing-box: less than 35 MB available in /tmp for preflight; unchanged"
+        return 1
+    fi
 
     # Inspect the digest-verified release binary in RAM before touching the live package.
     if ! (tar xOzf "$TMP_ENGINE_DIR/new.ipk" ./data.tar.gz | tar xOzf - ./usr/bin/sing-box > "$TMP_ENGINE_DIR/sing-box"); then
@@ -537,37 +679,43 @@ ensure_sing_box_updated() {
         fi
     done
 
-    # The exact installed stock version must be available BEFORE removal.
-    stock_version=$(opkg status sing-box | sed -n 's/^Version: //p' | sed -n '1p')
-    [ -n "$stock_version" ] || { log "❌ sing-box: installed version unknown; unchanged"; return 1; }
-    ensure_package_indexes_updated || { log "❌ sing-box: rollback index unavailable; unchanged"; return 1; }
-    if ! (cd "$TMP_ENGINE_DIR" && opkg download sing-box >/dev/null 2>&1); then
-        log "❌ sing-box: rollback package unavailable; unchanged"
-        return 1
+    if [ "$ENGINE_ORIGIN" = "stock" ]; then
+        # The exact installed stock version must be available BEFORE removal.
+        stock_version=$(opkg status sing-box | sed -n 's/^Version: //p' | sed -n '1p')
+        [ -n "$stock_version" ] || { log "❌ sing-box: installed version unknown; unchanged"; return 1; }
+        ensure_package_indexes_updated || { log "❌ sing-box: rollback index unavailable; unchanged"; return 1; }
+        if ! (cd "$TMP_ENGINE_DIR" && opkg download sing-box >/dev/null 2>&1); then
+            log "❌ sing-box: rollback package unavailable; unchanged"
+            return 1
+        fi
+        set -- "$TMP_ENGINE_DIR"/sing-box_*.ipk
+        case "$#:$1" in
+            1:"$TMP_ENGINE_DIR"/sing-box_"$stock_version"_*.ipk) ;;
+            *) log "❌ sing-box: exact rollback version $stock_version unavailable; unchanged"; return 1 ;;
+        esac
+        [ -f "$1" ] || { log "❌ sing-box: rollback package missing; unchanged"; return 1; }
+    else
+        backup_unowned_sing_box || return 1
     fi
-    set -- "$TMP_ENGINE_DIR"/sing-box_*.ipk
-    case "$#:$1" in
-        1:"$TMP_ENGINE_DIR"/sing-box_"$stock_version"_*.ipk) ;;
-        *) log "❌ sing-box: exact rollback version $stock_version unavailable; unchanged"; return 1 ;;
-    esac
-    [ -f "$1" ] || { log "❌ sing-box: rollback package missing; unchanged"; return 1; }
 
-    log "📦 sing-box: replacing stock package with tested $TESTED_ENGINE_VERSION"
+    log "📦 sing-box: replacing $ENGINE_ORIGIN binary with tested $TESTED_ENGINE_VERSION"
     ENGINE_SWITCH_ACTIVE="1"
     service podkop stop >/dev/null 2>&1
-    if ! opkg remove --force-depends sing-box >/dev/null 2>&1 ||
-        ! opkg install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
-        log "❌ sing-box: install failed; restoring stock package"
-        restore_stock_sing_box
-        ENGINE_SWITCH_ACTIVE="0"
+    if [ "$ENGINE_ORIGIN" = "stock" ] && ! opkg remove --force-depends sing-box >/dev/null 2>&1; then
+        log "❌ sing-box: stock package removal failed; restoring original"
+        rollback_engine_once
+        return 1
+    fi
+    if ! opkg install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
+        log "❌ sing-box: install failed; restoring original"
+        rollback_engine_once
         return 1
     fi
     service podkop restart >/dev/null 2>&1
     if ! wait_for_engine_health ||
         ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-        log "❌ sing-box: post-install check failed; restoring stock package"
-        restore_stock_sing_box
-        ENGINE_SWITCH_ACTIVE="0"
+        log "❌ sing-box: post-install check failed; restoring original"
+        rollback_engine_once
         return 1
     fi
     ENGINE_SWITCH_ACTIVE="0"
