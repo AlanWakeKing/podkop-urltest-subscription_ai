@@ -7,7 +7,7 @@ D=${1:-}
 SECONDS=${2:-1200}
 B=/etc/podkop-update-sing-box-backup
 case "$D:$SECONDS" in
-    /tmp/pdk-canary.*:* ) ;;
+    /tmp/pdk-canary:*|/tmp/pdk-canary.*:* ) ;;
     * ) echo 'invalid canary directory' >&2; exit 2 ;;
 esac
 case "$SECONDS" in ''|*[!0-9]*) echo 'invalid timer' >&2; exit 2 ;; esac
