@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.23.1"
+SCRIPT_VERSION="2026.11.24.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -15,6 +15,9 @@ UPDATES_ONLY="0"
 CHECK_SELF_UPDATE_ONLY="0"
 AUTO_UPDATE_SCRIPT="1"
 AUTO_UPDATE_PODKOP="0"
+AUTO_UPDATE_SING_BOX="1"
+# Pinned build verified against Podkop 0.7.24 and current REALITY nodes.
+TESTED_ENGINE_VERSION="1.14.4-r28"
 PODKOP_INSTALL_AUTO_YES="1"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh"
 PODKOP_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
@@ -81,6 +84,8 @@ TMP_POOL="$(mktemp)"
 TMP_FINAL="$(mktemp)"
 TMP_WRITTEN="$(mktemp)"
 TMP_CURRENT="$(mktemp)"
+TMP_ENGINE_DIR=""
+ENGINE_SWITCH_ACTIVE="0"
 
 LOCK_FILE="/var/run/podkop-update.lock"
 if [ -f "$LOCK_FILE" ]; then
@@ -92,7 +97,19 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 printf '%s\n' "$$" > "$LOCK_FILE"
 
-trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u" "$LOCK_FILE"' EXIT INT TERM
+cleanup_update() {
+    trap - INT TERM
+    if [ "$ENGINE_SWITCH_ACTIVE" = "1" ]; then
+        ENGINE_SWITCH_ACTIVE="0"
+        log "❌ sing-box: interrupted during package switch; attempting rollback"
+        restore_stock_sing_box
+    fi
+    rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" \
+        "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u" "$LOCK_FILE"
+    [ -z "$TMP_ENGINE_DIR" ] || rm -rf "$TMP_ENGINE_DIR"
+}
+trap 'cleanup_update' EXIT
+trap 'exit 143' INT TERM
 
 print_usage() {
     cat <<EOF
@@ -390,6 +407,172 @@ ensure_podkop_updated() {
     if [ "$found_pkg" != "1" ]; then
         log "ℹ️  Пакет Podkop не найден в списке: $PODKOP_PACKAGE_CANDIDATES"
     fi
+}
+
+# Podkop restart runs asynchronously; an init.d status can report success
+# before sing-box has bound its ports. Check the actual process and sockets.
+wait_for_engine_health() {
+    engine_attempt=0
+    while [ "$engine_attempt" -lt 30 ]; do
+        if podkop check_sing_box | jq -e '.sing_box_process_running == 1 and .sing_box_ports_listening == 1' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 3
+        engine_attempt=$((engine_attempt + 1))
+    done
+    return 1
+}
+
+# Restore the pre-downloaded stock package after a failed engine switch.
+restore_stock_sing_box() {
+    service podkop stop >/dev/null 2>&1
+    opkg remove --force-depends podkop-engine >/dev/null 2>&1
+    if opkg install "$TMP_ENGINE_DIR"/sing-box_*.ipk >/dev/null 2>&1; then
+        service podkop start >/dev/null 2>&1
+        if wait_for_engine_health; then
+            log "⚠️  Stock sing-box restored and running"
+            return 0
+        fi
+        log "❌ CRITICAL: stock package restored but Podkop did not start"
+    else
+        log "❌ CRITICAL: sing-box rollback package install failed"
+    fi
+    # Never leave dnsmasq directed at a dead sing-box on a remote router.
+    service podkop stop >/dev/null 2>&1
+    log "⚠️  Podkop stopped to restore ordinary DNS; manual recovery required"
+    return 1
+}
+
+# Only the tested, pinned podkop-engine build fixes the REALITY regression.
+# Stock 'sing-box' may be numerically newer but still lack that patch.
+ensure_sing_box_updated() {
+    [ "$AUTO_UPDATE_SING_BOX" = "1" ] || return 0
+    detect_package_manager || return 1
+    if [ "$PKG_MANAGER" != "opkg" ]; then
+        log "⚠️  sing-box: automatic replacement tested only on opkg; unchanged"
+        return 0
+    fi
+    if is_package_installed podkop-engine-full; then
+        log "⚠️  sing-box: podkop-engine-full installed; preserving broader protocol support"
+        return 0
+    fi
+    if is_package_installed podkop-engine; then
+        current_engine_version=$(opkg status podkop-engine | sed -n 's/^Version: //p' | sed -n '1p')
+        if [ -n "$current_engine_version" ] &&
+            opkg compare-versions "$current_engine_version" '>=' '1.13.21-r11' &&
+            sing-box version | grep -q -- '-pdk-r'; then
+            log "✅ sing-box: patched podkop-engine $current_engine_version already installed; unchanged"
+        else
+            log "⚠️  sing-box: unverified podkop-engine $current_engine_version; manual review required"
+        fi
+        return 0
+    fi
+    if ! is_package_installed sing-box; then
+        log "⚠️  sing-box: unknown package; unchanged"
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || { log "❌ sing-box: curl required for verified download; unchanged"; return 1; }
+    ensure_jq_installed || { log "❌ sing-box: jq unavailable; unchanged"; return 1; }
+
+    engine_arch=$(opkg print-architecture | awk 'END {print $2}')
+    case "$engine_arch" in
+        ''|all|noarch|*[!a-zA-Z0-9_-]*)
+            log "❌ sing-box: unsupported package architecture; unchanged"
+            return 1 ;;
+    esac
+    engine_asset="podkop-engine_${TESTED_ENGINE_VERSION}_openwrt_${engine_arch}.ipk"
+    engine_release="https://api.github.com/repos/podkop-net/podkop-engine/releases/tags/v${TESTED_ENGINE_VERSION}"
+    TMP_ENGINE_DIR=$(mktemp -d /tmp/podkop-engine-upgrade.XXXXXX) || return 1
+    chmod 700 "$TMP_ENGINE_DIR"
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 40 -o "$TMP_ENGINE_DIR/release.json" "$engine_release" 2>/dev/null; then
+        log "❌ sing-box: pinned release metadata unavailable; unchanged"
+        return 1
+    fi
+    engine_record=$(jq -r --arg name "$engine_asset" '.assets[] | select(.name == $name) | [.url, .digest] | @tsv' "$TMP_ENGINE_DIR/release.json" | sed -n '1p')
+    engine_url=$(printf '%s\n' "$engine_record" | cut -f1)
+    engine_digest=$(printf '%s\n' "$engine_record" | cut -f2)
+    engine_hash=${engine_digest#sha256:}
+    case "$engine_url:$engine_digest" in
+        https://api.github.com/repos/podkop-net/podkop-engine/releases/assets/*:sha256:*) ;;
+        *) log "❌ sing-box: no trusted package/digest for $engine_arch; unchanged"; return 1 ;;
+    esac
+    if [ "${#engine_hash}" -ne 64 ] || printf '%s' "$engine_hash" | grep -q '[^0-9a-f]'; then
+        log "❌ sing-box: invalid SHA256 digest; unchanged"
+        return 1
+    fi
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 -H 'Accept: application/octet-stream' \
+        -o "$TMP_ENGINE_DIR/new.ipk" "$engine_url" 2>/dev/null; then
+        log "❌ sing-box: package download failed; unchanged"
+        return 1
+    fi
+    printf '%s  %s\n' "$engine_hash" "$TMP_ENGINE_DIR/new.ipk" | sha256sum -c - >/dev/null 2>&1 || {
+        log "❌ sing-box: package SHA256 mismatch; unchanged"
+        return 1
+    }
+
+    # Inspect the digest-verified release binary in RAM before touching the live package.
+    if ! (tar xOzf "$TMP_ENGINE_DIR/new.ipk" ./data.tar.gz | tar xOzf - ./usr/bin/sing-box > "$TMP_ENGINE_DIR/sing-box"); then
+        log "❌ sing-box: package extraction failed; unchanged"
+        return 1
+    fi
+    chmod 700 "$TMP_ENGINE_DIR/sing-box"
+    expected_binary="${TESTED_ENGINE_VERSION%-r*}-pdk-r${TESTED_ENGINE_VERSION##*-r}"
+    if ! "$TMP_ENGINE_DIR/sing-box" version | grep -q "^sing-box version $expected_binary$" ||
+        ! "$TMP_ENGINE_DIR/sing-box" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        log "❌ sing-box: binary version/config preflight failed; unchanged"
+        return 1
+    fi
+
+    # The candidate must actually connect using this router's credentials.
+    for engine_type in hysteria2 vless; do
+        engine_tag=$(jq -r --arg type "$engine_type" '[.outbounds[] | select(.type == $type) | .tag][0] // empty' /etc/sing-box/config.json)
+        [ -n "$engine_tag" ] || continue
+        jq --arg tag "$engine_tag" '{log:{level:"error"},outbounds:[.outbounds[] | select(.tag == $tag)],route:{final:$tag}}' \
+            /etc/sing-box/config.json > "$TMP_ENGINE_DIR/probe.json" || return 1
+        if ! "$TMP_ENGINE_DIR/sing-box" tools fetch -c "$TMP_ENGINE_DIR/probe.json" -o "$engine_tag" \
+            "$URLTEST_TESTING_URL" >/dev/null 2>&1; then
+            log "❌ sing-box: candidate cannot reach $engine_type through $engine_tag; unchanged"
+            return 1
+        fi
+    done
+
+    # The exact installed stock version must be available BEFORE removal.
+    stock_version=$(opkg status sing-box | sed -n 's/^Version: //p' | sed -n '1p')
+    [ -n "$stock_version" ] || { log "❌ sing-box: installed version unknown; unchanged"; return 1; }
+    ensure_package_indexes_updated || { log "❌ sing-box: rollback index unavailable; unchanged"; return 1; }
+    if ! (cd "$TMP_ENGINE_DIR" && opkg download sing-box >/dev/null 2>&1); then
+        log "❌ sing-box: rollback package unavailable; unchanged"
+        return 1
+    fi
+    set -- "$TMP_ENGINE_DIR"/sing-box_*.ipk
+    case "$#:$1" in
+        1:"$TMP_ENGINE_DIR"/sing-box_"$stock_version"_*.ipk) ;;
+        *) log "❌ sing-box: exact rollback version $stock_version unavailable; unchanged"; return 1 ;;
+    esac
+    [ -f "$1" ] || { log "❌ sing-box: rollback package missing; unchanged"; return 1; }
+
+    log "📦 sing-box: replacing stock package with tested $TESTED_ENGINE_VERSION"
+    ENGINE_SWITCH_ACTIVE="1"
+    service podkop stop >/dev/null 2>&1
+    if ! opkg remove --force-depends sing-box >/dev/null 2>&1 ||
+        ! opkg install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
+        log "❌ sing-box: install failed; restoring stock package"
+        restore_stock_sing_box
+        ENGINE_SWITCH_ACTIVE="0"
+        return 1
+    fi
+    service podkop restart >/dev/null 2>&1
+    if ! wait_for_engine_health ||
+        ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        log "❌ sing-box: post-install check failed; restoring stock package"
+        restore_stock_sing_box
+        ENGINE_SWITCH_ACTIVE="0"
+        return 1
+    fi
+    ENGINE_SWITCH_ACTIVE="0"
+    log "✅ sing-box: $TESTED_ENGINE_VERSION installed; Podkop running"
+    return 0
 }
 
 ensure_script_updated() {
@@ -808,6 +991,7 @@ if [ "$UPDATES_ONLY" = "1" ]; then
     log "🔄 Проверка обновлений..."
     ensure_script_updated
     ensure_podkop_updated
+    ensure_sing_box_updated || exit 1
     ensure_cron_job
     log "✅ Проверка обновлений завершена"
     exit 0
