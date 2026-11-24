@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.24.2"
+SCRIPT_VERSION="2026.11.24.3"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -481,15 +481,17 @@ restore_unowned_sing_box() {
         return 1
     }
     if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
-        if ! opkg remove --force-depends podkop-engine >/dev/null 2>&1; then
-            log "❌ CRITICAL: cannot remove podkop-engine during rollback"
+        remove_rc=0
+        opkg remove --force-depends podkop-engine >/dev/null 2>&1 || remove_rc=$?
+        installed_now=$(opkg list-installed 2>/dev/null) || {
+            log "❌ CRITICAL: cannot re-read opkg database after rollback removal"
+            return 1
+        }
+        if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+            log "❌ CRITICAL: podkop-engine removal failed (exit $remove_rc)"
             return 1
         fi
-    fi
-    installed_now=$(opkg list-installed 2>/dev/null) || return 1
-    if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
-        log "❌ CRITICAL: podkop-engine still registered; original binary not restored over owned path"
-        return 1
+        [ "$remove_rc" -eq 0 ] || log "⚠️  opkg remove returned $remove_rc, but package is absent from installed database"
     fi
     if [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.gz" ] || [ ! -f "$UNOWNED_BACKUP_DIR/sha256" ]; then
         log "❌ CRITICAL: unowned binary backup missing"
