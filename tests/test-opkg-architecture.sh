@@ -43,9 +43,3 @@ noarch 1
 aarch64_cortex-a53 10' 'aarch64_cortex-a53'
 assert_arch 'universal-only output has no target architecture' 'arch all 1
 arch noarch 1' ''
-
-update_url=$(sed -n 's/^SCRIPT_UPDATE_URL="\([^"]*\)"$/\1/p' "$UPDATE_SCRIPT")
-case "$update_url" in
-    */canary-singbox-r28/update.sh) echo 'PASS: canary self-update stays on canary branch' ;;
-    *) printf 'FAIL: canary self-update points to <%s>\n' "$update_url" >&2; exit 1 ;;
-esac

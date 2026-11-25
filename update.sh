@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.24.4"
+SCRIPT_VERSION="2026.11.25.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -16,10 +16,10 @@ CHECK_SELF_UPDATE_ONLY="0"
 AUTO_UPDATE_SCRIPT="1"
 AUTO_UPDATE_PODKOP="0"
 AUTO_UPDATE_SING_BOX="1"
-# Pinned build verified against Podkop 0.7.24 and current REALITY nodes.
-TESTED_ENGINE_VERSION="1.14.4-r28"
+# Pinned build selected for the current Podkop integration.
+TESTED_ENGINE_VERSION="1.14.4-r29"
 PODKOP_INSTALL_AUTO_YES="1"
-SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/canary-singbox-r28/update.sh"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/AlanWakeKing/podkop-urltest-subscription_ai/main/update.sh"
 PODKOP_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
 PODKOP_PACKAGE_CANDIDATES="luci-app-podkop podkop"
 PKG_MANAGER=""
@@ -86,9 +86,124 @@ TMP_WRITTEN="$(mktemp)"
 TMP_CURRENT="$(mktemp)"
 TMP_ENGINE_DIR=""
 ENGINE_SWITCH_ACTIVE="0"
+ENGINE_RECOVERY_REQUIRED="0"
+ENGINE_RECOVERY_DIR="/overlay/podkop-update-sing-box-recovery"
+ENGINE_RECOVERY_PACKAGE=""
+ENGINE_RECOVERY_CREATED="0"
 ENGINE_ORIGIN=""
+ENGINE_PREVIOUS_VERSION=""
+STOCK_PREVIOUS_VERSION=""
+STOCK_PREVIOUS_BINARY_SHA256=""
+STOCK_ROLLBACK_BINARY_SHA256=""
+STOCK_BINARY_PATH="/usr/bin/sing-box"
+STOCK_ROLLBACK_PACKAGE=""
+STOCK_ROLLBACK_BINARY_VERSION=""
 UNOWNED_BACKUP_DIR="/etc/podkop-update-sing-box-backup"
 UNOWNED_BACKUP_STAGING=""
+
+persistent_overlay_mountpoint() {
+    mount_target=$1
+    mounts_file=${2:-/proc/mounts}
+    case "$mount_target" in /*) ;; *) return 1 ;; esac
+    [ -d "$mount_target" ] && [ ! -L "$mount_target" ] || return 1
+    [ -r "$mounts_file" ] || return 1
+    mount_record=$(awk -v path="$mount_target" '
+        $2 == path {
+            exact_count++
+            if (NF != 6 || $1 == "" || $2 == "" || $3 == "" || $4 == "" || $5 !~ /^[0-9]+$/ || $6 !~ /^[0-9]+$/)
+                invalid = 1
+            exact_source = $1
+            exact_path = $2
+            exact_type = $3
+            exact_options = $4
+        }
+        END {
+            if (exact_count == 1 && !invalid) print exact_source "|" exact_path "|" exact_type "|" exact_options
+        }
+    ' "$mounts_file") || return 1
+    mount_source=$(printf '%s\n' "$mount_record" | cut -d '|' -f1)
+    mount_path=$(printf '%s\n' "$mount_record" | cut -d '|' -f2)
+    mount_type=$(printf '%s\n' "$mount_record" | cut -d '|' -f3)
+    mount_options=$(printf '%s\n' "$mount_record" | cut -d '|' -f4)
+    if [ -z "$mount_source" ] || [ -z "$mount_path" ] || [ -z "$mount_type" ] || [ -z "$mount_options" ]; then
+        return 1
+    fi
+    case "$mount_source" in /dev/loop*|loop*) return 1 ;; esac
+    case "$mount_type" in ext4|f2fs|jffs2|ubifs) ;; *) return 1 ;; esac
+    case ",$mount_options," in *,rw,*) ;; *) return 1 ;; esac
+    printf '%s\n' "$mount_path"
+}
+
+persist_engine_recovery_package() {
+    recovery_source=$1
+    recovery_destination=$2
+    recovery_overlay=$3
+    recovery_origin=$4
+    recovery_version=$5
+    [ -f "$recovery_source" ] && [ ! -L "$recovery_source" ] || return 1
+    case "$recovery_origin" in podkop-engine|stock) ;; *) return 1 ;; esac
+    case "$recovery_version" in ''|*[!a-zA-Z0-9.+_-]*) return 1 ;; esac
+    recovery_parent=${recovery_destination%/*}
+    case "$recovery_overlay" in /*) ;; *) return 1 ;; esac
+    if [ "$recovery_parent" != "$recovery_overlay" ] ||
+        [ ! -d "$recovery_overlay" ] || [ ! -w "$recovery_overlay" ]; then
+        log "❌ CRITICAL: recovery destination must be a writable direct child of the persistent overlay"
+        return 1
+    fi
+    recovery_mounts_file=${6:-/proc/mounts}
+    recovery_overlay_mountpoint=$(persistent_overlay_mountpoint "$recovery_overlay" "$recovery_mounts_file") || {
+        log "❌ CRITICAL: $recovery_overlay is not backed by a writable persistent filesystem"
+        return 1
+    }
+    if [ -e "$recovery_destination" ] || [ -L "$recovery_destination" ]; then
+        log "❌ CRITICAL: prior recovery directory exists at $recovery_destination; refusing package update"
+        return 1
+    fi
+    recovery_size_bytes=$(wc -c < "$recovery_source" | tr -d '[:space:]') || return 1
+    case "$recovery_size_bytes" in ''|0*|*[!0-9]*) return 1 ;; esac
+    [ "${#recovery_size_bytes}" -le 9 ] || return 1
+    recovery_overlay_df=$(df -Pk "$recovery_overlay" 2>/dev/null) || return 1
+    recovery_overlay_free_kb=$(printf '%s\n' "$recovery_overlay_df" | awk -v path="$recovery_overlay_mountpoint" '
+        NR == 1 { next }
+        NF >= 6 && $NF == path { rows++; available = $4 }
+        END { if (rows == 1 && available ~ /^[0-9]+$/) print available }
+    ')
+    case "$recovery_overlay_free_kb" in ''|*[!0-9]*) return 1 ;; esac
+    case "$recovery_overlay_free_kb" in 0*) [ "$recovery_overlay_free_kb" = "0" ] || return 1 ;; esac
+    recovery_required_kb=$(((recovery_size_bytes + 1023) / 1024 + 12000))
+    # size_bytes is at most 9 decimal digits, so required_kb is < 1,000,000.
+    # Values with 7+ digits therefore exceed the maximum reserve without shell arithmetic.
+    if [ "${#recovery_overlay_free_kb}" -le 6 ] &&
+        [ "$recovery_overlay_free_kb" -lt "$recovery_required_kb" ]; then
+        log "❌ sing-box: insufficient /overlay space for persistent rollback package"
+        return 1
+    fi
+    recovery_source_hash=$(sha256sum "$recovery_source" 2>/dev/null | cut -d ' ' -f1) || return 1
+    [ "${#recovery_source_hash}" -eq 64 ] || return 1
+    recovery_staging=$(mktemp -d "${recovery_destination}.XXXXXX") || return 1
+    chmod 700 "$recovery_staging" || { rm -rf "$recovery_staging"; return 1; }
+    if ! cp "$recovery_source" "$recovery_staging/rollback.ipk" ||
+        ! chmod 600 "$recovery_staging/rollback.ipk" ||
+        [ "$(wc -c < "$recovery_staging/rollback.ipk" | tr -d '[:space:]')" != "$recovery_size_bytes" ] ||
+        [ "$(sha256sum "$recovery_staging/rollback.ipk" 2>/dev/null | cut -d ' ' -f1)" != "$recovery_source_hash" ]; then
+        rm -rf "$recovery_staging"
+        return 1
+    fi
+    {
+        printf 'origin=%s\n' "$recovery_origin"
+        printf 'version=%s\n' "$recovery_version"
+        printf 'size_bytes=%s\n' "$recovery_size_bytes"
+        printf 'sha256=%s\n' "$recovery_source_hash"
+    } > "$recovery_staging/manifest" || { rm -rf "$recovery_staging"; return 1; }
+    chmod 600 "$recovery_staging/manifest" || { rm -rf "$recovery_staging"; return 1; }
+    if ! mv "$recovery_staging" "$recovery_destination"; then
+        rm -rf "$recovery_staging"
+        return 1
+    fi
+    ENGINE_RECOVERY_PACKAGE="$recovery_destination/rollback.ipk"
+    ENGINE_RECOVERY_CREATED="1"
+    return 0
+}
 
 LOCK_FILE="/var/run/podkop-update.lock"
 if [ -f "$LOCK_FILE" ]; then
@@ -104,13 +219,37 @@ cleanup_update() {
     # A second TERM during emergency rollback must not abort recovery.
     trap '' INT TERM
     if [ "$ENGINE_SWITCH_ACTIVE" = "1" ]; then
-        ENGINE_SWITCH_ACTIVE="0"
         log "❌ sing-box: interrupted during package switch; attempting rollback"
-        restore_previous_sing_box
+        cleanup_restore_rc=0
+        restore_previous_sing_box || cleanup_restore_rc=$?
+        if [ "$cleanup_restore_rc" -ne 0 ]; then
+            ENGINE_RECOVERY_REQUIRED="1"
+            log "❌ CRITICAL: automatic engine rollback failed during cleanup; manual recovery required"
+            if ! stop_podkop_and_verify; then
+                service podkop stop >/dev/null 2>&1 || :
+                log "❌ CRITICAL: Podkop could not be confirmed stopped after rollback failure"
+            else
+                log "⚠️  Podkop is stopped after rollback failure; manual recovery required"
+            fi
+        else
+            ENGINE_RECOVERY_REQUIRED="0"
+            ENGINE_SWITCH_ACTIVE="0"
+        fi
     fi
     rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "$TMP_WRITTEN" "$TMP_CURRENT" \
         "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u" "${TMP_WRITTEN}.u" "${TMP_CURRENT}.u" "$LOCK_FILE"
-    [ -z "$TMP_ENGINE_DIR" ] || rm -rf "$TMP_ENGINE_DIR"
+    if [ -n "$TMP_ENGINE_DIR" ] && [ "$ENGINE_RECOVERY_REQUIRED" = "1" ]; then
+        log "❌ CRITICAL: temporary recovery artifacts retained at $TMP_ENGINE_DIR"
+    elif [ -n "$TMP_ENGINE_DIR" ]; then
+        rm -rf "$TMP_ENGINE_DIR"
+    fi
+    if [ "${ENGINE_RECOVERY_CREATED:-0}" = "1" ]; then
+        if [ "$ENGINE_RECOVERY_REQUIRED" = "1" ]; then
+            log "❌ CRITICAL: persistent rollback package and manifest retained at $ENGINE_RECOVERY_DIR"
+        elif ! rm -rf "$ENGINE_RECOVERY_DIR"; then
+            log "❌ CRITICAL: unable to remove unused persistent rollback artifacts at $ENGINE_RECOVERY_DIR"
+        fi
+    fi
     [ -z "$UNOWNED_BACKUP_STAGING" ] || rm -rf "$UNOWNED_BACKUP_STAGING"
 }
 trap 'cleanup_update' EXIT
@@ -428,6 +567,30 @@ wait_for_engine_health() {
     return 1
 }
 
+# Verify the unowned-binary backup still leaves its 12 MiB persistent reserve.
+unowned_backup_overlay_space_ready() {
+    backup_mounts_file=${1:-/proc/mounts}
+    backup_overlay_path=${2:-/overlay}
+    backup_overlay_mountpoint=$(persistent_overlay_mountpoint "$backup_overlay_path" "$backup_mounts_file") || return 1
+    backup_overlay_df=$(df -Pk "$backup_overlay_path" 2>/dev/null) || return 1
+    backup_free_kb=$(printf '%s\n' "$backup_overlay_df" | awk -v path="$backup_overlay_mountpoint" '
+        NR == 1 { next }
+        $NF == path {
+            rows++
+            if (NF < 6 || $4 !~ /^[0-9]+$/) invalid = 1
+            else available = $4
+        }
+        END {
+            if (rows == 1 && !invalid) print available
+        }
+    ') || return 1
+    case "$backup_free_kb" in ''|*[!0-9]*) return 1 ;; esac
+    case "$backup_free_kb" in 0*) [ "$backup_free_kb" = "0" ] || return 1 ;; esac
+    # Values with 7+ digits exceed 999,999 KiB, so avoid shell arithmetic.
+    [ "${#backup_free_kb}" -le 6 ] || return 0
+    [ "$backup_free_kb" -ge 12000 ]
+}
+
 # An unowned binary has no opkg package to reinstall. Keep a persistent,
 # private copy across reboot before allowing a package to claim its paths.
 backup_unowned_sing_box() {
@@ -460,9 +623,8 @@ backup_unowned_sing_box() {
     [ ! -f /etc/init.d/sing-box ] || cp -p /etc/init.d/sing-box "$UNOWNED_BACKUP_STAGING/sing-box.init" || return 1
     [ ! -f /etc/config/sing-box ] || cp -p /etc/config/sing-box "$UNOWNED_BACKUP_STAGING/sing-box.uci" || return 1
     [ ! -f /etc/sing-box/config.json ] || cp -p /etc/sing-box/config.json "$UNOWNED_BACKUP_STAGING/config.json" || return 1
-    backup_free_kb=$(df -Pk /overlay | awk 'NR==2 {print $4}')
-    if [ -z "$backup_free_kb" ] || [ "$backup_free_kb" -lt 12000 ]; then
-        log "❌ sing-box: insufficient overlay space after persistent backup; unchanged"
+    if ! unowned_backup_overlay_space_ready; then
+        log "❌ sing-box: insufficient or ambiguous /overlay space after persistent backup; unchanged"
         return 1
     fi
     if ! mv "$UNOWNED_BACKUP_STAGING" "$UNOWNED_BACKUP_DIR"; then
@@ -475,7 +637,15 @@ backup_unowned_sing_box() {
 }
 
 restore_unowned_sing_box() {
-    service podkop stop >/dev/null 2>&1
+    unowned_binary_path=${1:-/usr/bin/sing-box}
+    unowned_backup_dir=${2:-$UNOWNED_BACKUP_DIR}
+    unowned_init_path=${3:-/etc/init.d/sing-box}
+    unowned_uci_path=${4:-/etc/config/sing-box}
+    unowned_config_path=${5:-/etc/sing-box/config.json}
+    stop_podkop_and_verify || {
+        log "❌ CRITICAL: cannot confirm Podkop is stopped before restoring unowned sing-box"
+        return 1
+    }
     installed_now=$(opkg list-installed 2>/dev/null) || {
         log "❌ CRITICAL: cannot read opkg database during rollback"
         return 1
@@ -493,37 +663,140 @@ restore_unowned_sing_box() {
         fi
         [ "$remove_rc" -eq 0 ] || log "⚠️  opkg remove returned $remove_rc, but package is absent from installed database"
     fi
-    if [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.gz" ] || [ ! -f "$UNOWNED_BACKUP_DIR/sha256" ]; then
+    if [ ! -f "$unowned_backup_dir/sing-box.gz" ] || [ ! -f "$unowned_backup_dir/sha256" ]; then
         log "❌ CRITICAL: unowned binary backup missing"
         return 1
     fi
-    expected_old_hash=$(cat "$UNOWNED_BACKUP_DIR/sha256")
+    expected_old_hash=$(cat "$unowned_backup_dir/sha256")
     # Verify the compressed backup before touching the executable. Streaming
     # avoids filling OpenWrt's small /tmp during an emergency rollback.
-    actual_old_hash=$(gzip -dc "$UNOWNED_BACKUP_DIR/sing-box.gz" | sha256sum | cut -d ' ' -f1)
-    if ! gzip -t "$UNOWNED_BACKUP_DIR/sing-box.gz" 2>/dev/null ||
+    actual_old_hash=$(gzip -dc "$unowned_backup_dir/sing-box.gz" | sha256sum | cut -d ' ' -f1)
+    if ! gzip -t "$unowned_backup_dir/sing-box.gz" 2>/dev/null ||
         [ "$expected_old_hash" != "$actual_old_hash" ]; then
         log "❌ CRITICAL: original binary backup failed checksum verification"
         return 1
     fi
-    current_old_hash=$(sha256sum /usr/bin/sing-box 2>/dev/null | cut -d ' ' -f1)
+    current_old_hash=$(sha256sum "$unowned_binary_path" 2>/dev/null | cut -d ' ' -f1)
     if [ "$current_old_hash" != "$expected_old_hash" ]; then
-        if ! gzip -dc "$UNOWNED_BACKUP_DIR/sing-box.gz" > /usr/bin/sing-box ||
-            ! chmod 755 /usr/bin/sing-box ||
-            [ "$(sha256sum /usr/bin/sing-box | cut -d ' ' -f1)" != "$expected_old_hash" ]; then
+        if ! gzip -dc "$unowned_backup_dir/sing-box.gz" > "$unowned_binary_path" ||
+            ! chmod 755 "$unowned_binary_path" ||
+            [ "$(sha256sum "$unowned_binary_path" | cut -d ' ' -f1)" != "$expected_old_hash" ]; then
             log "❌ CRITICAL: cannot restore original binary"
             return 1
         fi
     fi
-    [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.init" ] || cp -p "$UNOWNED_BACKUP_DIR/sing-box.init" /etc/init.d/sing-box || return 1
-    [ ! -f "$UNOWNED_BACKUP_DIR/sing-box.uci" ] || cp -p "$UNOWNED_BACKUP_DIR/sing-box.uci" /etc/config/sing-box || return 1
-    [ ! -f "$UNOWNED_BACKUP_DIR/config.json" ] || cp -p "$UNOWNED_BACKUP_DIR/config.json" /etc/sing-box/config.json || return 1
-    service podkop start >/dev/null 2>&1
-    if wait_for_engine_health; then
+    [ ! -f "$unowned_backup_dir/sing-box.init" ] || cp -p "$unowned_backup_dir/sing-box.init" "$unowned_init_path" || return 1
+    [ ! -f "$unowned_backup_dir/sing-box.uci" ] || cp -p "$unowned_backup_dir/sing-box.uci" "$unowned_uci_path" || return 1
+    [ ! -f "$unowned_backup_dir/config.json" ] || cp -p "$unowned_backup_dir/config.json" "$unowned_config_path" || return 1
+    if [ "$(sha256sum "$unowned_binary_path" 2>/dev/null | cut -d ' ' -f1)" != "$expected_old_hash" ]; then
+        log "❌ CRITICAL: restored unowned binary hash does not match the verified backup"
+        return 1
+    fi
+    if start_podkop_and_check "$unowned_binary_path" "$unowned_config_path"; then
         log "⚠️  Original unowned sing-box restored and running"
         return 0
     fi
-    log "❌ CRITICAL: original binary restored but Podkop failed to start"
+    log "❌ CRITICAL: original unowned binary restored but config/start/health check failed"
+    stop_podkop_and_verify || log "❌ CRITICAL: Podkop could not be confirmed stopped after unowned rollback failure"
+    return 1
+}
+
+start_podkop_and_check() {
+    sing_box_executable=${1:-sing-box}
+    sing_box_config=${2:-/etc/sing-box/config.json}
+    "$sing_box_executable" check -c "$sing_box_config" >/dev/null 2>&1 || return 1
+    start_rc=0
+    service podkop start >/dev/null 2>&1 || start_rc=$?
+    [ "$start_rc" -eq 0 ] || return 1
+    wait_for_engine_health
+}
+
+restart_podkop_and_check() {
+    restart_rc=0
+    service podkop restart >/dev/null 2>&1 || restart_rc=$?
+    [ "$restart_rc" -eq 0 ] || return 1
+    wait_for_engine_health && sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1
+}
+
+stop_podkop_and_verify() {
+    stop_command_rc=0
+    service podkop stop >/dev/null 2>&1 || stop_command_rc=$?
+    engine_stop_attempt=0
+    while [ "$engine_stop_attempt" -lt 30 ]; do
+        if podkop check_sing_box 2>/dev/null | jq -e '.sing_box_process_running == 0 and .sing_box_ports_listening == 0' >/dev/null 2>&1; then
+            [ "$stop_command_rc" -eq 0 ] || log "⚠️  Podkop stop returned $stop_command_rc, but process and ports are confirmed stopped"
+            return 0
+        fi
+        sleep 1
+        engine_stop_attempt=$((engine_stop_attempt + 1))
+    done
+    log "❌ CRITICAL: Podkop process or ports remain active after stop request (exit $stop_command_rc)"
+    return 1
+}
+
+restore_podkop_engine() {
+    stop_podkop_and_verify || {
+        log "❌ CRITICAL: cannot confirm Podkop is stopped before engine rollback"
+        return 1
+    }
+    rollback_package=${ENGINE_RECOVERY_PACKAGE:-$TMP_ENGINE_DIR/rollback.ipk}
+    if [ ! -f "$rollback_package" ] || [ -z "$ENGINE_PREVIOUS_VERSION" ]; then
+        log "❌ CRITICAL: verified podkop-engine rollback package missing"
+        return 1
+    fi
+    installed_now=$(opkg list-installed 2>/dev/null) || {
+        log "❌ CRITICAL: cannot read opkg database during engine rollback"
+        return 1
+    }
+    if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+        installed_status=$(opkg status podkop-engine 2>/dev/null) || {
+            log "❌ CRITICAL: cannot read installed podkop-engine status during rollback"
+            return 1
+        }
+        installed_engine_version=$(printf '%s\n' "$installed_status" | sed -n 's/^Version: //p' | sed -n '1p')
+        if [ -z "$installed_engine_version" ]; then
+            log "❌ CRITICAL: installed podkop-engine version is unknown; refusing rollback transaction"
+            return 1
+        fi
+        if [ "$installed_engine_version" = "$ENGINE_PREVIOUS_VERSION" ]; then
+            # Exact rollback IPK and install-contract parity were verified before switching.
+            if ! opkg --force-reinstall install "$rollback_package" >/dev/null 2>&1; then
+                log "❌ CRITICAL: verified podkop-engine reinstall transaction failed"
+                service podkop stop >/dev/null 2>&1
+                return 1
+            fi
+        else
+            # Keep the package installed so opkg can validate and apply one downgrade transaction.
+            if ! opkg --force-downgrade install "$rollback_package" >/dev/null 2>&1; then
+                log "❌ CRITICAL: verified podkop-engine downgrade transaction failed"
+                service podkop stop >/dev/null 2>&1
+                return 1
+            fi
+        fi
+    else
+        if ! opkg install "$rollback_package" >/dev/null 2>&1; then
+            log "❌ CRITICAL: verified podkop-engine rollback package install failed"
+            service podkop stop >/dev/null 2>&1
+            return 1
+        fi
+    fi
+    restored_status=$(opkg status podkop-engine 2>/dev/null) || {
+        log "❌ CRITICAL: cannot read restored podkop-engine status"
+        service podkop stop >/dev/null 2>&1
+        return 1
+    }
+    restored_package_version=$(printf '%s\n' "$restored_status" | sed -n 's/^Version: //p' | sed -n '1p')
+    expected_binary=$(engine_binary_version_for_package "$ENGINE_PREVIOUS_VERSION") || expected_binary=""
+    restored_binary_version=$(sing-box version 2>/dev/null | sed -n '1p')
+    if [ "$restored_package_version" = "$ENGINE_PREVIOUS_VERSION" ] &&
+        [ -n "$expected_binary" ] &&
+        [ "$restored_binary_version" = "sing-box version $expected_binary" ] &&
+        restart_podkop_and_check; then
+        log "⚠️  Previous podkop-engine $ENGINE_PREVIOUS_VERSION restored and running"
+        return 0
+    fi
+    log "❌ CRITICAL: previous podkop-engine restored incompletely; stopping Podkop"
+    service podkop stop >/dev/null 2>&1
     return 1
 }
 
@@ -531,6 +804,7 @@ restore_previous_sing_box() {
     case "$ENGINE_ORIGIN" in
         stock) restore_stock_sing_box && return 0 ;;
         unowned) restore_unowned_sing_box && return 0 ;;
+        podkop-engine) restore_podkop_engine && return 0 ;;
         *) log "❌ CRITICAL: unknown original sing-box package" ;;
     esac
     service podkop stop >/dev/null 2>&1
@@ -540,28 +814,177 @@ restore_previous_sing_box() {
 
 rollback_engine_once() {
     trap '' INT TERM
-    restore_previous_sing_box
-    ENGINE_SWITCH_ACTIVE="0"
+    rollback_rc=0
+    restore_previous_sing_box || rollback_rc=$?
+    if [ "$rollback_rc" -eq 0 ]; then
+        ENGINE_SWITCH_ACTIVE="0"
+        ENGINE_RECOVERY_REQUIRED="0"
+    else
+        ENGINE_RECOVERY_REQUIRED="1"
+        log "❌ CRITICAL: automatic engine rollback failed; preserving recovery state for exit cleanup"
+        if ! stop_podkop_and_verify; then
+            service podkop stop >/dev/null 2>&1 || :
+            log "❌ CRITICAL: Podkop could not be confirmed stopped after rollback failure"
+        fi
+    fi
     trap 'exit 143' INT TERM
+    return "$rollback_rc"
+}
+
+remove_stock_sing_box_packages() {
+    remove_rc=0
+    opkg remove --force-depends sing-box sing-box-tiny >/dev/null 2>&1 || remove_rc=$?
+    installed_now=$(opkg list-installed 2>/dev/null) || {
+        log "❌ sing-box: cannot verify stock package removal"
+        return 1
+    }
+    remaining_stock_packages=$(printf '%s\n' "$installed_now" | awk '
+        $1 == "sing-box" || $1 == "sing-box-tiny" { print $1 }
+    ')
+    if [ -n "$remaining_stock_packages" ]; then
+        log "❌ sing-box: stock packages remain after removal: $remaining_stock_packages"
+        return 1
+    fi
+    [ "$remove_rc" -eq 0 ] || log "⚠️  sing-box: opkg remove returned $remove_rc, but both stock packages are absent"
+    return 0
+}
+
+install_candidate_engine() {
+    log "📦 sing-box: replacing $ENGINE_ORIGIN binary with tested $TESTED_ENGINE_VERSION"
+    ENGINE_SWITCH_ACTIVE="1"
+    if ! stop_podkop_and_verify; then
+        ENGINE_SWITCH_ACTIVE="0"
+        log "❌ sing-box: cannot confirm Podkop is stopped; package unchanged"
+        return 1
+    fi
+    if [ "$ENGINE_ORIGIN" = "stock" ] && ! remove_stock_sing_box_packages; then
+        log "❌ sing-box: stock package removal failed; restoring original"
+        rollback_engine_once
+        return 1
+    fi
+    if ! opkg install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
+        log "❌ sing-box: install failed; restoring original"
+        rollback_engine_once
+        return 1
+    fi
+    installed_status=$(opkg status podkop-engine 2>/dev/null) || {
+        log "❌ sing-box: cannot read installed candidate package status; restoring original"
+        rollback_engine_once
+        return 1
+    }
+    installed_engine_version=$(printf '%s\n' "$installed_status" | sed -n 's/^Version: //p' | sed -n '1p')
+    expected_binary=$(engine_binary_version_for_package "$TESTED_ENGINE_VERSION") || expected_binary=""
+    installed_binary_version=$(sing-box version 2>/dev/null | sed -n '1p')
+    if [ "$installed_engine_version" != "$TESTED_ENGINE_VERSION" ] ||
+        [ -z "$expected_binary" ] ||
+        [ "$installed_binary_version" != "sing-box version $expected_binary" ] ||
+        ! restart_podkop_and_check; then
+        log "❌ sing-box: post-install package/binary/health check failed; restoring original"
+        rollback_engine_once
+        return 1
+    fi
+    ENGINE_SWITCH_ACTIVE="0"
+    log "✅ sing-box: $TESTED_ENGINE_VERSION installed; Podkop running"
+    return 0
 }
 
 # Restore the pre-downloaded stock package after a failed engine switch.
 restore_stock_sing_box() {
-    service podkop stop >/dev/null 2>&1
-    opkg remove --force-depends podkop-engine >/dev/null 2>&1
-    if opkg install "$TMP_ENGINE_DIR"/sing-box_*.ipk >/dev/null 2>&1; then
-        service podkop start >/dev/null 2>&1
-        if wait_for_engine_health; then
-            log "⚠️  Stock sing-box restored and running"
-            return 0
-        fi
-        log "❌ CRITICAL: stock package restored but Podkop did not start"
-    else
-        log "❌ CRITICAL: sing-box rollback package install failed"
+    stop_podkop_and_verify || {
+        log "❌ CRITICAL: cannot confirm Podkop is stopped before stock sing-box rollback"
+        return 1
+    }
+    if [ -z "$STOCK_ROLLBACK_PACKAGE" ] || [ ! -f "$STOCK_ROLLBACK_PACKAGE" ] ||
+        [ -z "$STOCK_PREVIOUS_VERSION" ] || [ -z "$STOCK_ROLLBACK_BINARY_VERSION" ] ||
+        [ "${#STOCK_ROLLBACK_BINARY_SHA256}" -ne 64 ]; then
+        log "❌ CRITICAL: verified stock sing-box rollback package/state is missing"
+        return 1
     fi
-    # Never leave dnsmasq directed at a dead sing-box on a remote router.
-    service podkop stop >/dev/null 2>&1
-    log "⚠️  Podkop stopped to restore ordinary DNS; manual recovery required"
+    case "$STOCK_ROLLBACK_BINARY_SHA256" in *[!0-9a-f]*)
+        log "❌ CRITICAL: verified stock sing-box rollback binary hash is malformed"
+        return 1 ;;
+    esac
+    installed_now=$(opkg list-installed 2>/dev/null) || {
+        log "❌ CRITICAL: cannot read opkg database during stock rollback"
+        return 1
+    }
+    if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+        remove_rc=0
+        opkg remove --force-depends podkop-engine >/dev/null 2>&1 || remove_rc=$?
+        installed_now=$(opkg list-installed 2>/dev/null) || {
+            log "❌ CRITICAL: cannot re-read opkg database after stock rollback removal"
+            return 1
+        }
+        if printf '%s\n' "$installed_now" | grep -q '^podkop-engine - '; then
+            log "❌ CRITICAL: podkop-engine removal failed (exit $remove_rc)"
+            return 1
+        fi
+        [ "$remove_rc" -eq 0 ] || log "⚠️  opkg remove returned $remove_rc, but podkop-engine is absent"
+    fi
+    stock_payload_matches=0
+    stock_expected_binary_hash="$STOCK_ROLLBACK_BINARY_SHA256"
+    if printf '%s\n' "$installed_now" | grep -q '^sing-box - '; then
+        preexisting_stock_status=$(opkg status sing-box 2>/dev/null || :)
+        preexisting_stock_version=$(printf '%s\n' "$preexisting_stock_status" | awk '
+            /^Package: / { packages++; package_name = $2 }
+            /^Version: / { versions++; package_version = $2 }
+            /^Status: / { statuses++; if ($NF == "installed") installed = 1 }
+            END {
+                if (packages == 1 && package_name == "sing-box" && versions == 1 &&
+                    statuses == 1 && installed && package_version != "") print package_version
+            }
+        ')
+        preexisting_stock_binary=$(sing-box version 2>/dev/null | sed -n '1p')
+        preexisting_stock_binary_hash=$(sha256sum "$STOCK_BINARY_PATH" 2>/dev/null | awk 'NR == 1 {print $1}')
+        if [ "$preexisting_stock_version" = "$STOCK_PREVIOUS_VERSION" ] &&
+            [ "$preexisting_stock_binary" = "$STOCK_ROLLBACK_BINARY_VERSION" ] &&
+            [ "${#STOCK_PREVIOUS_BINARY_SHA256}" -eq 64 ] &&
+            [ "$preexisting_stock_binary_hash" = "$STOCK_PREVIOUS_BINARY_SHA256" ]; then
+            stock_payload_matches=1
+            stock_expected_binary_hash="$STOCK_PREVIOUS_BINARY_SHA256"
+        fi
+    fi
+    if [ "$stock_payload_matches" != 1 ]; then
+        if printf '%s\n' "$installed_now" | grep -q '^sing-box - '; then
+            if ! opkg --force-downgrade --force-reinstall install "$STOCK_ROLLBACK_PACKAGE" >/dev/null 2>&1; then
+                log "❌ CRITICAL: exact stock sing-box reinstall/downgrade failed"
+                return 1
+            fi
+        elif ! opkg install "$STOCK_ROLLBACK_PACKAGE" >/dev/null 2>&1; then
+            log "❌ CRITICAL: exact stock sing-box package install failed"
+            return 1
+        fi
+    fi
+    restored_status=$(opkg status sing-box 2>/dev/null) || {
+        log "❌ CRITICAL: cannot read restored stock sing-box status"
+        return 1
+    }
+    restored_package_fields=$(printf '%s\n' "$restored_status" | awk '
+        /^Package: / { packages++; package_name = $2 }
+        /^Version: / { versions++; package_version = $2 }
+        /^Status: / { statuses++; if ($NF == "installed") installed = 1 }
+        END {
+            if (!installed || packages != 1 || versions != 1 || statuses != 1) exit 1
+            printf "%s\t%s", package_name, package_version
+        }
+    ') || {
+        log "❌ CRITICAL: restored stock sing-box package status is malformed"
+        return 1
+    }
+    restored_package_name=$(printf '%s\n' "$restored_package_fields" | cut -f1)
+    restored_package_version=$(printf '%s\n' "$restored_package_fields" | cut -f2)
+    restored_binary_version=$(sing-box version 2>/dev/null | sed -n '1p')
+    restored_binary_hash=$(sha256sum "$STOCK_BINARY_PATH" 2>/dev/null | awk 'NR == 1 {print $1}')
+    if [ "$restored_package_name" = 'sing-box' ] &&
+        [ "$restored_package_version" = "$STOCK_PREVIOUS_VERSION" ] &&
+        [ "$restored_binary_version" = "$STOCK_ROLLBACK_BINARY_VERSION" ] &&
+        [ "$restored_binary_hash" = "$stock_expected_binary_hash" ] &&
+        start_podkop_and_check; then
+        log "⚠️  Stock sing-box $STOCK_PREVIOUS_VERSION restored and running"
+        return 0
+    fi
+    log "❌ CRITICAL: stock package/version/binary/config/health verification failed"
+    stop_podkop_and_verify || log "❌ CRITICAL: Podkop could not be confirmed stopped after stock rollback failure"
     return 1
 }
 
@@ -586,11 +1009,385 @@ detect_opkg_engine_arch() {
     '
 }
 
+engine_tmp_space_ready() {
+    asset_size_bytes=$1
+    reserve_kb=${2:-35000}
+    [ -n "$asset_size_bytes" ] && [ -n "$reserve_kb" ] || return 1
+    case "$asset_size_bytes" in ''|0*|*[!0-9]*) return 1 ;; esac
+    case "$reserve_kb" in
+        ''|*[!0-9]*) return 1 ;;
+        0*) [ "$reserve_kb" = "0" ] || return 1 ;;
+    esac
+    # Keep decimal arithmetic inside 32-bit BusyBox ash's signed range:
+    # package bytes <= 999,999,999 and reserve KB <= 999,999.
+    [ "${#asset_size_bytes}" -le 9 ] && [ "${#reserve_kb}" -le 6 ] || return 1
+    tmp_df_output=$(df -Pk /tmp 2>/dev/null) || return 1
+    tmp_free_kb=$(printf '%s\n' "$tmp_df_output" | awk '
+        NR == 1 { next }
+        $NF == "/tmp" {
+            rows++
+            if (NF < 6 || $4 !~ /^[0-9]+$/) invalid = 1
+            else available = $4
+        }
+        END {
+            if (rows == 1 && !invalid) print available
+        }
+    ') || return 1
+    case "$tmp_free_kb" in ''|*[!0-9]*) return 1 ;; esac
+    case "$tmp_free_kb" in 0*) [ "$tmp_free_kb" = "0" ] || return 1 ;; esac
+    [ "${#tmp_free_kb}" -le 9 ] || return 0
+    required_tmp_kb=$(((asset_size_bytes + 1023) / 1024 + reserve_kb))
+    [ "$tmp_free_kb" -ge "$required_tmp_kb" ]
+}
+
+release_asset_details() {
+    release_json=$1
+    asset_name=$2
+    jq -e '.assets | type == "array"' "$release_json" >/dev/null 2>&1 || return 1
+    asset_count=$(jq --arg name "$asset_name" '[.assets[] | select(.name == $name)] | length' "$release_json" 2>/dev/null) || return 1
+    [ "$asset_count" = "1" ] || return 1
+    jq -er --arg name "$asset_name" '
+        .assets[] | select(.name == $name) |
+        select((.url | type) == "string" and (.digest | type) == "string" and
+            (.size | type) == "number" and .size > 0 and (.size | floor) == .size) |
+        [.url, .digest, (.size | tostring)] | @tsv
+    ' "$release_json" 2>/dev/null
+}
+
+engine_release_asset_url() {
+    release_json=$1
+    asset_name=$2
+    [ -f "$release_json" ] && [ ! -L "$release_json" ] || return 1
+    case "$asset_name" in ''|*[!a-zA-Z0-9._+-]*) return 1 ;; esac
+    command -v jsonfilter >/dev/null 2>&1 || return 1
+    engine_url=$(jsonfilter -e "@.assets[@.name='$asset_name'].url" < "$release_json" 2>/dev/null) || return 1
+    asset_url_count=$(printf '%s\n' "$engine_url" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$asset_url_count" = 1 ] || return 1
+    asset_api_prefix='https://api.github.com/repos/podkop-net/podkop-engine/releases/assets/'
+    case "$engine_url" in "$asset_api_prefix"*) ;; *) return 1 ;; esac
+    asset_id=${engine_url#"$asset_api_prefix"}
+    case "$asset_id" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$engine_url"
+}
+
+opkg_info_package_size() {
+    package_name=$1
+    expected_version=$2
+    package_info=$(opkg info "$package_name" 2>/dev/null) || return 1
+    printf '%s\n' "$package_info" | awk -v wanted_package="$package_name" -v wanted_version="$expected_version" '
+        function finish_package() {
+            if (current_package == wanted_package && current_version == wanted_version) {
+                matches++
+                if (version_fields != 1 || size_fields != 1 || size !~ /^[0-9]+$/ || size + 0 <= 0) invalid = 1
+                else selected_size = size
+            }
+        }
+        /^Package: / {
+            finish_package()
+            current_package = $2
+            current_version = ""
+            version_fields = 0
+            size_fields = 0
+            size = ""
+            next
+        }
+        /^Version: / { current_version = $2; version_fields++; next }
+        /^Size: / { size = $2; size_fields++; next }
+        END {
+            finish_package()
+            if (invalid || matches != 1) exit 1
+            print selected_size
+        }
+    '
+}
+
+opkg_status_database_ready() {
+    status_file=${1:-/usr/lib/opkg/status}
+    [ -s "$status_file" ] || return 1
+    awk '
+        function finish_stanza() {
+            if (have_package && (!have_version || !have_status)) invalid = 1
+        }
+        /^[[:space:]]*$/ { next }
+        /^[[:space:]]/ { next }
+        /^Package: / {
+            finish_stanza()
+            package_name = $2
+            if (package_name == "" || seen[package_name]++) invalid = 1
+            have_package = 1
+            have_version = 0
+            have_status = 0
+            package_count++
+            next
+        }
+        /^Version: / { if (!have_package || have_version++ || $2 == "") invalid = 1; next }
+        /^Status: / { if (!have_package || have_status++ || NF < 2) invalid = 1; next }
+        { if (index($0, ":") < 2) invalid = 1 }
+        END {
+            finish_stanza()
+            if (invalid || package_count == 0 || seen["base-files"] != 1) exit 1
+        }
+    ' "$status_file" || return 1
+    base_files_status=$(opkg status base-files 2>/dev/null) || return 1
+    printf '%s\n' "$base_files_status" | awk '
+        /^Package: / { packages++; if ($2 != "base-files") invalid = 1 }
+        /^Version: / { versions++; if ($2 == "") invalid = 1 }
+        /^Status: / { statuses++; if ($NF != "installed") invalid = 1 }
+        END { if (invalid || packages != 1 || versions != 1 || statuses != 1) exit 1 }
+    ' || return 1
+    installed_list=$(opkg list-installed 2>/dev/null) || return 1
+    printf '%s\n' "$installed_list" | awk '
+        $2 == "-" && $3 != "" {
+            if (seen[$1]++) invalid = 1
+            if ($1 == "base-files") base_count++
+            package_count++
+        }
+        END { if (invalid || package_count == 0 || base_count != 1) exit 1 }
+    '
+}
+
+engine_binary_version_for_package() {
+    package_version=$1
+    case "$package_version" in
+        *-r*) ;;
+        *) return 1 ;;
+    esac
+    package_revision=${package_version##*-r}
+    case "$package_revision" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s-pdk-r%s' "${package_version%-r*}" "$package_revision"
+}
+
+engine_ipk_control_valid() {
+    package_file=$1
+    package_control=$(tar xOzf "$package_file" ./control.tar.gz 2>/dev/null | tar xOzf - ./control 2>/dev/null) || return 1
+    printf '%s\n' "$package_control" | awk '
+        BEGIN { invalid = 0; previous_field = 0; have_field = 0 }
+        /^[[:space:]]*$/ { previous_field = 0; next }
+        /^[[:space:]]/ {
+            if (!previous_field) { invalid = 1; exit }
+            next
+        }
+        {
+            colon = index($0, ":")
+            if (index($0, "\r") || colon < 2) {
+                invalid = 1
+                exit
+            }
+            field = substr($0, 1, colon - 1)
+            if (field !~ /^[A-Za-z0-9][A-Za-z0-9-]*$/ || seen[field]++) {
+                invalid = 1
+                exit
+            }
+            previous_field = 1
+            have_field = 1
+        }
+        END { if (invalid || !have_field) exit 1 }
+    '
+}
+
+engine_ipk_control_field() {
+    package_file=$1
+    field_name=$2
+    package_control=$(tar xOzf "$package_file" ./control.tar.gz 2>/dev/null | tar xOzf - ./control 2>/dev/null) || return 1
+    printf '%s\n' "$package_control" | awk -v key="$field_name" '
+        {
+            if (substr($0, 1, length(key) + 1) == key ":") {
+                found = 1
+                value = substr($0, length(key) + 2)
+                sub(/^[[:space:]]+/, "", value)
+                next
+            }
+            if (found && /^[[:space:]]/) {
+                sub(/^[[:space:]]+/, " ")
+                value = value $0
+                next
+            }
+            if (found) {
+                print value
+                printed = 1
+                exit
+            }
+        }
+        END { if (found && !printed) print value }
+    '
+}
+
+engine_ipk_install_contracts_match() {
+    candidate_package=$1
+    rollback_package=$2
+    engine_ipk_control_valid "$candidate_package" || return 1
+    engine_ipk_control_valid "$rollback_package" || return 1
+    for field_name in Depends Pre-Depends Conflicts Breaks Replaces Provides; do
+        candidate_value=$(engine_ipk_control_field "$candidate_package" "$field_name") || return 1
+        rollback_value=$(engine_ipk_control_field "$rollback_package" "$field_name") || return 1
+        [ "$candidate_value" = "$rollback_value" ] || return 1
+    done
+}
+
+verify_engine_ipk() {
+    package_file=$1
+    expected_package_version=$2
+    binary_output=$3
+    expected_arch=$4
+    expected_binary=$(engine_binary_version_for_package "$expected_package_version") || return 1
+    engine_ipk_control_valid "$package_file" || return 1
+    package_control=$(tar xOzf "$package_file" ./control.tar.gz 2>/dev/null | tar xOzf - ./control 2>/dev/null) || return 1
+    actual_package_name=$(printf '%s\n' "$package_control" | sed -n 's/^Package: //p' | sed -n '1p')
+    actual_package_version=$(printf '%s\n' "$package_control" | sed -n 's/^Version: //p' | sed -n '1p')
+    actual_package_arch=$(printf '%s\n' "$package_control" | sed -n 's/^Architecture: //p' | sed -n '1p')
+    [ "$actual_package_name" = 'podkop-engine' ] || return 1
+    [ "$actual_package_version" = "$expected_package_version" ] || return 1
+    [ "$actual_package_arch" = "$expected_arch" ] || return 1
+    # Candidate and rollback packages must expose the core install contract; a
+    # missing field cannot be treated as proof that the packages are compatible.
+    for required_field in Depends Conflicts Provides; do
+        required_value=$(engine_ipk_control_field "$package_file" "$required_field") || return 1
+        [ -n "$required_value" ] || return 1
+    done
+    if ! (tar xOzf "$package_file" ./data.tar.gz | tar xOzf - ./usr/bin/sing-box > "$binary_output"); then
+        rm -f "$binary_output"
+        return 1
+    fi
+    chmod 700 "$binary_output" || { rm -f "$binary_output"; return 1; }
+    if ! "$binary_output" version | grep -q "^sing-box version $expected_binary$"; then
+        rm -f "$binary_output"
+        return 1
+    fi
+}
+
+verify_stock_sing_box_ipk() {
+    package_file=$1
+    expected_package_version=$2
+    binary_output=$3
+    expected_arch=$4
+    engine_ipk_control_valid "$package_file" || return 1
+    package_control=$(tar xOzf "$package_file" ./control.tar.gz 2>/dev/null | tar xOzf - ./control 2>/dev/null) || return 1
+    actual_package_name=$(printf '%s\n' "$package_control" | sed -n 's/^Package: //p' | sed -n '1p')
+    actual_package_version=$(printf '%s\n' "$package_control" | sed -n 's/^Version: //p' | sed -n '1p')
+    actual_package_arch=$(printf '%s\n' "$package_control" | sed -n 's/^Architecture: //p' | sed -n '1p')
+    [ "$actual_package_name" = 'sing-box' ] || return 1
+    [ "$actual_package_version" = "$expected_package_version" ] || return 1
+    [ "$actual_package_arch" = "$expected_arch" ] || return 1
+    if ! (tar xOzf "$package_file" ./data.tar.gz | tar xOzf - ./usr/bin/sing-box > "$binary_output"); then
+        rm -f "$binary_output"
+        return 1
+    fi
+    chmod 700 "$binary_output" || { rm -f "$binary_output"; return 1; }
+    stock_version_output=$("$binary_output" version 2>/dev/null) || { rm -f "$binary_output"; return 1; }
+    stock_binary_version=$(printf '%s\n' "$stock_version_output" | sed -n '1p')
+    case "$stock_binary_version" in
+        'sing-box version '*) [ -n "${stock_binary_version#sing-box version }" ] || { rm -f "$binary_output"; return 1; } ;;
+        *) rm -f "$binary_output"; return 1 ;;
+    esac
+    printf '%s\n' "$stock_binary_version"
+}
+
+download_engine_rollback_package() {
+    rollback_version=$1
+    case "$rollback_version" in
+        ''|*[!a-zA-Z0-9.+_-]*)
+            log "❌ sing-box: invalid installed engine version for rollback"
+            return 1 ;;
+    esac
+    rollback_asset="podkop-engine_${rollback_version}_openwrt_${engine_arch}.ipk"
+    rollback_release="https://api.github.com/repos/podkop-net/podkop-engine/releases/tags/v${rollback_version}"
+    rollback_metadata="$TMP_ENGINE_DIR/rollback-release.json"
+    rollback_package="$TMP_ENGINE_DIR/rollback.ipk"
+    if ! curl -fsSL --connect-timeout 10 --max-time 40 -o "$rollback_metadata" "$rollback_release" 2>/dev/null; then
+        log "❌ sing-box: exact rollback release $rollback_version unavailable; unchanged"
+        return 1
+    fi
+    rollback_record=$(release_asset_details "$rollback_metadata" "$rollback_asset") || {
+        log "❌ sing-box: rollback asset is missing, duplicated, or malformed; unchanged"
+        return 1
+    }
+    rollback_url=$(printf '%s\n' "$rollback_record" | cut -f1)
+    rollback_digest=$(printf '%s\n' "$rollback_record" | cut -f2)
+    rollback_asset_size=$(printf '%s\n' "$rollback_record" | cut -f3)
+    rollback_hash=${rollback_digest#sha256:}
+    case "$rollback_url:$rollback_digest" in
+        https://api.github.com/repos/podkop-net/podkop-engine/releases/assets/*:sha256:*) ;;
+        *) log "❌ sing-box: no trusted rollback package/digest for $rollback_version; unchanged"; return 1 ;;
+    esac
+    if [ "${#rollback_hash}" -ne 64 ] || printf '%s' "$rollback_hash" | grep -q '[^0-9a-f]'; then
+        log "❌ sing-box: invalid rollback SHA256 digest; unchanged"
+        return 1
+    fi
+    if ! engine_tmp_space_ready "$rollback_asset_size" 35000; then
+        log "❌ sing-box: insufficient /tmp space for rollback download plus 35 MB reserve; unchanged"
+        return 1
+    fi
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 -H 'Accept: application/octet-stream' \
+        -o "$rollback_package" "$rollback_url" 2>/dev/null; then
+        log "❌ sing-box: rollback package download failed; unchanged"
+        return 1
+    fi
+    downloaded_rollback_size=$(wc -c < "$rollback_package" | tr -d '[:space:]')
+    [ "$downloaded_rollback_size" = "$rollback_asset_size" ] || { log "❌ sing-box: rollback asset size differs from release metadata; unchanged"; return 1; }
+    printf '%s  %s\n' "$rollback_hash" "$rollback_package" | sha256sum -c - >/dev/null 2>&1 || {
+        log "❌ sing-box: rollback package SHA256 mismatch; unchanged"
+        return 1
+    }
+    # The downloaded package is already accounted for; require 35,000 KiB
+    # remaining for inspection/extraction using the same validated df parser.
+    if ! engine_tmp_space_ready 1 34999; then
+        log "❌ sing-box: less than 35 MB available in /tmp for rollback preflight; unchanged"
+        return 1
+    fi
+    if ! verify_engine_ipk "$rollback_package" "$rollback_version" "$TMP_ENGINE_DIR/rollback-sing-box" "$engine_arch"; then
+        log "❌ sing-box: rollback package metadata/binary mismatch; unchanged"
+        return 1
+    fi
+    if ! engine_ipk_install_contracts_match "$TMP_ENGINE_DIR/new.ipk" "$rollback_package"; then
+        log "❌ sing-box: candidate and rollback package install contracts differ; unchanged"
+        return 1
+    fi
+    if ! persist_engine_recovery_package "$rollback_package" "$ENGINE_RECOVERY_DIR" /overlay podkop-engine "$rollback_version"; then
+        log "❌ sing-box: could not preserve exact engine rollback IPK on /overlay; unchanged"
+        return 1
+    fi
+    rm -f "$TMP_ENGINE_DIR/rollback-sing-box"
+    # The candidate's opkg preflight covers these matching install contracts; rollback is applied as one downgrade transaction.
+}
+
+engine_upgrade_action() {
+    current_version=$1
+    current_binary_version=$2
+    expected_binary=$(engine_binary_version_for_package "$current_version") || {
+        printf 'unverified'
+        return 0
+    }
+    if [ "$current_binary_version" != "sing-box version $expected_binary" ] ||
+        ! opkg compare-versions "$current_version" '>=' "$current_version"; then
+        printf 'unverified'
+        return 0
+    fi
+    if opkg compare-versions "$current_version" '>=' "$TESTED_ENGINE_VERSION"; then
+        if opkg compare-versions "$TESTED_ENGINE_VERSION" '>=' "$current_version"; then
+            printf 'current'
+        else
+            printf 'newer'
+        fi
+    else
+        printf 'upgrade'
+    fi
+}
+
 ensure_sing_box_updated() {
     [ "$AUTO_UPDATE_SING_BOX" = "1" ] || return 0
+    if [ -e "$ENGINE_RECOVERY_DIR" ] || [ -L "$ENGINE_RECOVERY_DIR" ]; then
+        log "❌ CRITICAL: prior engine recovery artifact exists at $ENGINE_RECOVERY_DIR; manual recovery required before another update"
+        return 1
+    fi
     detect_package_manager || return 1
     if [ "$PKG_MANAGER" != "opkg" ]; then
         log "⚠️  sing-box: automatic replacement tested only on opkg; unchanged"
+        return 0
+    fi
+    if ! opkg_status_database_ready; then
+        log "⚠️  sing-box: opkg status database is empty or unhealthy; unchanged"
         return 0
     fi
     if is_package_installed podkop-engine-full; then
@@ -598,36 +1395,51 @@ ensure_sing_box_updated() {
         return 0
     fi
     if is_package_installed podkop-engine; then
-        current_engine_version=$(opkg status podkop-engine | sed -n 's/^Version: //p' | sed -n '1p')
-        if [ -n "$current_engine_version" ] &&
-            opkg compare-versions "$current_engine_version" '>=' '1.13.21-r11' &&
-            sing-box version | grep -q -- '-pdk-r'; then
-            log "✅ sing-box: patched podkop-engine $current_engine_version already installed; unchanged"
-        else
-            log "⚠️  sing-box: unverified podkop-engine $current_engine_version; manual review required"
-        fi
-        return 0
-    fi
-    binary_owner=$(opkg search /usr/bin/sing-box 2>/dev/null) || {
-        log "❌ sing-box: ownership lookup failed; unchanged"
-        return 1
-    }
-    init_owner=$(opkg search /etc/init.d/sing-box 2>/dev/null) || {
-        log "❌ sing-box: init-script ownership lookup failed; unchanged"
-        return 1
-    }
-    if is_package_installed sing-box; then
-        ENGINE_ORIGIN="stock"
-    elif [ -x /usr/bin/sing-box ] && [ -x /etc/init.d/sing-box ] &&
-        [ -z "$binary_owner" ] && [ -z "$init_owner" ] &&
-        ! sing-box version | grep -q -- '-pdk-r'; then
-        ENGINE_ORIGIN="unowned"
-        log "ℹ️  sing-box binary and init script are unowned by opkg; persistent backup required"
+        current_engine_version=$(opkg status podkop-engine 2>/dev/null | sed -n 's/^Version: //p' | sed -n '1p')
+        current_engine_binary_version=$(sing-box version 2>/dev/null | sed -n '1p')
+        engine_action=$(engine_upgrade_action "$current_engine_version" "$current_engine_binary_version")
+        case "$engine_action" in
+            current)
+                log "✅ sing-box: tested podkop-engine $current_engine_version already installed; unchanged"
+                return 0 ;;
+            newer)
+                log "✅ sing-box: newer podkop-engine $current_engine_version preserved; unchanged"
+                return 0 ;;
+            unverified)
+                log "⚠️  sing-box: podkop-engine package/binary state is unverified; manual review required"
+                return 0 ;;
+            upgrade)
+                ENGINE_ORIGIN="podkop-engine"
+                ENGINE_PREVIOUS_VERSION="$current_engine_version"
+                log "ℹ️  sing-box: verified podkop-engine $current_engine_version will be upgraded to $TESTED_ENGINE_VERSION" ;;
+            *)
+                log "⚠️  sing-box: unknown engine upgrade decision; unchanged"
+                return 0 ;;
+        esac
     else
-        log "⚠️  sing-box: unknown package/owner; unchanged"
-        return 0
+        binary_owner=$(opkg search /usr/bin/sing-box 2>/dev/null) || {
+            log "❌ sing-box: ownership lookup failed; unchanged"
+            return 1
+        }
+        init_owner=$(opkg search /etc/init.d/sing-box 2>/dev/null) || {
+            log "❌ sing-box: init-script ownership lookup failed; unchanged"
+            return 1
+        }
+        if is_package_installed sing-box; then
+            ENGINE_ORIGIN="stock"
+        elif [ -x /usr/bin/sing-box ] && [ -x /etc/init.d/sing-box ] &&
+            [ -z "$binary_owner" ] && [ -z "$init_owner" ] &&
+            ! sing-box version | grep -q -- '-pdk-r'; then
+            ENGINE_ORIGIN="unowned"
+            log "ℹ️  sing-box binary and init script are unowned by opkg; persistent backup required"
+        else
+            log "⚠️  sing-box: unknown package/owner; unchanged"
+            return 0
+        fi
     fi
     command -v curl >/dev/null 2>&1 || { log "❌ sing-box: curl required for verified download; unchanged"; return 1; }
+    command -v wget >/dev/null 2>&1 || { log "❌ sing-box: wget required for GitHub asset download; unchanged"; return 1; }
+    command -v jsonfilter >/dev/null 2>&1 || { log "❌ sing-box: jsonfilter required for GitHub asset selection; unchanged"; return 1; }
     ensure_jq_installed || { log "❌ sing-box: jq unavailable; unchanged"; return 1; }
 
     engine_arch=$(detect_opkg_engine_arch)
@@ -641,13 +1453,25 @@ ensure_sing_box_updated() {
     TMP_ENGINE_DIR=$(mktemp -d /tmp/podkop-engine-upgrade.XXXXXX) || return 1
     chmod 700 "$TMP_ENGINE_DIR"
 
-    if ! curl -fsSL --connect-timeout 10 --max-time 40 -o "$TMP_ENGINE_DIR/release.json" "$engine_release" 2>/dev/null; then
+    if ! wget -qO "$TMP_ENGINE_DIR/release.json" "$engine_release" 2>/dev/null; then
         log "❌ sing-box: pinned release metadata unavailable; unchanged"
         return 1
     fi
-    engine_record=$(jq -r --arg name "$engine_asset" '.assets[] | select(.name == $name) | [.url, .digest] | @tsv' "$TMP_ENGINE_DIR/release.json" | sed -n '1p')
-    engine_url=$(printf '%s\n' "$engine_record" | cut -f1)
+    engine_record=$(release_asset_details "$TMP_ENGINE_DIR/release.json" "$engine_asset") || {
+        log "❌ sing-box: release asset is missing, duplicated, or malformed; unchanged"
+        return 1
+    }
+    metadata_engine_url=$(printf '%s\n' "$engine_record" | cut -f1)
     engine_digest=$(printf '%s\n' "$engine_record" | cut -f2)
+    engine_asset_size=$(printf '%s\n' "$engine_record" | cut -f3)
+    engine_url=$(engine_release_asset_url "$TMP_ENGINE_DIR/release.json" "$engine_asset") || {
+        log "❌ sing-box: jsonfilter did not select exactly one trusted release asset; unchanged"
+        return 1
+    }
+    [ "$engine_url" = "$metadata_engine_url" ] || {
+        log "❌ sing-box: asset URL differs between jsonfilter and release metadata parser; unchanged"
+        return 1
+    }
     engine_hash=${engine_digest#sha256:}
     case "$engine_url:$engine_digest" in
         https://api.github.com/repos/podkop-net/podkop-engine/releases/assets/*:sha256:*) ;;
@@ -657,33 +1481,37 @@ ensure_sing_box_updated() {
         log "❌ sing-box: invalid SHA256 digest; unchanged"
         return 1
     fi
-    if ! curl -fsSL --connect-timeout 10 --max-time 120 -H 'Accept: application/octet-stream' \
-        -o "$TMP_ENGINE_DIR/new.ipk" "$engine_url" 2>/dev/null; then
+    if ! engine_tmp_space_ready "$engine_asset_size" 35000; then
+        log "❌ sing-box: insufficient /tmp space for candidate download plus 35 MB reserve; unchanged"
+        return 1
+    fi
+    if ! wget -O "$TMP_ENGINE_DIR/new.ipk" --header='Accept: application/octet-stream' \
+        "$engine_url" >/dev/null 2>&1; then
         log "❌ sing-box: package download failed; unchanged"
         return 1
     fi
+    downloaded_engine_size=$(wc -c < "$TMP_ENGINE_DIR/new.ipk" | tr -d '[:space:]')
+    [ "$downloaded_engine_size" = "$engine_asset_size" ] || { log "❌ sing-box: candidate asset size differs from release metadata; unchanged"; return 1; }
     printf '%s  %s\n' "$engine_hash" "$TMP_ENGINE_DIR/new.ipk" | sha256sum -c - >/dev/null 2>&1 || {
         log "❌ sing-box: package SHA256 mismatch; unchanged"
         return 1
     }
     # The package and extracted executable coexist in tmpfs. Leave enough
     # headroom for the tested build and the router's other temporary files.
-    engine_tmp_free_kb=$(df -Pk /tmp | awk 'NR==2 {print $4}')
-    if [ -z "$engine_tmp_free_kb" ] || [ "$engine_tmp_free_kb" -lt 35000 ]; then
+    # The downloaded package is already accounted for; require 35,000 KiB
+    # remaining for candidate inspection/extraction through the validated parser.
+    if ! engine_tmp_space_ready 1 34999; then
         log "❌ sing-box: less than 35 MB available in /tmp for preflight; unchanged"
         return 1
     fi
 
-    # Inspect the digest-verified release binary in RAM before touching the live package.
-    if ! (tar xOzf "$TMP_ENGINE_DIR/new.ipk" ./data.tar.gz | tar xOzf - ./usr/bin/sing-box > "$TMP_ENGINE_DIR/sing-box"); then
-        log "❌ sing-box: package extraction failed; unchanged"
+    # Inspect the digest-verified package metadata and binary in RAM before touching the live package.
+    if ! verify_engine_ipk "$TMP_ENGINE_DIR/new.ipk" "$TESTED_ENGINE_VERSION" "$TMP_ENGINE_DIR/sing-box" "$engine_arch"; then
+        log "❌ sing-box: package metadata/binary preflight failed; unchanged"
         return 1
     fi
-    chmod 700 "$TMP_ENGINE_DIR/sing-box"
-    expected_binary="${TESTED_ENGINE_VERSION%-r*}-pdk-r${TESTED_ENGINE_VERSION##*-r}"
-    if ! "$TMP_ENGINE_DIR/sing-box" version | grep -q "^sing-box version $expected_binary$" ||
-        ! "$TMP_ENGINE_DIR/sing-box" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-        log "❌ sing-box: binary version/config preflight failed; unchanged"
+    if ! "$TMP_ENGINE_DIR/sing-box" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        log "❌ sing-box: candidate config preflight failed; unchanged"
         return 1
     fi
 
@@ -700,47 +1528,81 @@ ensure_sing_box_updated() {
         fi
     done
 
-    if [ "$ENGINE_ORIGIN" = "stock" ]; then
-        # The exact installed stock version must be available BEFORE removal.
-        stock_version=$(opkg status sing-box | sed -n 's/^Version: //p' | sed -n '1p')
-        [ -n "$stock_version" ] || { log "❌ sing-box: installed version unknown; unchanged"; return 1; }
-        ensure_package_indexes_updated || { log "❌ sing-box: rollback index unavailable; unchanged"; return 1; }
-        if ! (cd "$TMP_ENGINE_DIR" && opkg download sing-box >/dev/null 2>&1); then
-            log "❌ sing-box: rollback package unavailable; unchanged"
-            return 1
-        fi
-        set -- "$TMP_ENGINE_DIR"/sing-box_*.ipk
-        case "$#:$1" in
-            1:"$TMP_ENGINE_DIR"/sing-box_"$stock_version"_*.ipk) ;;
-            *) log "❌ sing-box: exact rollback version $stock_version unavailable; unchanged"; return 1 ;;
-        esac
-        [ -f "$1" ] || { log "❌ sing-box: rollback package missing; unchanged"; return 1; }
-    else
-        backup_unowned_sing_box || return 1
-    fi
+    rm -f "$TMP_ENGINE_DIR/sing-box" "$TMP_ENGINE_DIR/probe.json"
+    case "$ENGINE_ORIGIN" in
+        stock)
+            # The exact installed stock version must be available BEFORE removal.
+            stock_status=$(opkg status sing-box 2>/dev/null) || { log "❌ sing-box: cannot query installed stock package; unchanged"; return 1; }
+            stock_version=$(printf '%s\n' "$stock_status" | sed -n 's/^Version: //p' | sed -n '1p')
+            [ -n "$stock_version" ] || { log "❌ sing-box: installed version unknown; unchanged"; return 1; }
+            STOCK_PREVIOUS_VERSION="$stock_version"
+            STOCK_PREVIOUS_BINARY_SHA256=$(sha256sum "$STOCK_BINARY_PATH" 2>/dev/null | awk 'NR == 1 {print $1}')
+            case "$STOCK_PREVIOUS_BINARY_SHA256" in ''|*[!0-9a-f]*)
+                log "❌ sing-box: could not fingerprint the installed stock binary; unchanged"
+                return 1 ;;
+            esac
+            [ "${#STOCK_PREVIOUS_BINARY_SHA256}" -eq 64 ] || {
+                log "❌ sing-box: installed stock binary SHA256 is malformed; unchanged"
+                return 1
+            }
+            ensure_package_indexes_updated || { log "❌ sing-box: rollback index unavailable; unchanged"; return 1; }
+            stock_package_size=$(opkg_info_package_size sing-box "$stock_version") || {
+                log "❌ sing-box: exact stock package size unavailable from opkg metadata; unchanged"
+                return 1
+            }
+            engine_tmp_space_ready "$stock_package_size" 35000 || {
+                log "❌ sing-box: insufficient /tmp space for stock rollback download plus 35 MB reserve; unchanged"
+                return 1
+            }
+            if ! (cd "$TMP_ENGINE_DIR" && opkg download sing-box >/dev/null 2>&1); then
+                log "❌ sing-box: rollback package unavailable; unchanged"
+                return 1
+            fi
+            set -- "$TMP_ENGINE_DIR"/sing-box_*.ipk
+            case "$#:$1" in
+                1:"$TMP_ENGINE_DIR"/sing-box_"$stock_version"_*.ipk) ;;
+                *) log "❌ sing-box: exact rollback version $stock_version unavailable; unchanged"; return 1 ;;
+            esac
+            [ -f "$1" ] || { log "❌ sing-box: rollback package missing; unchanged"; return 1; }
+            downloaded_stock_size=$(wc -c < "$1" | tr -d '[:space:]')
+            [ "$downloaded_stock_size" = "$stock_package_size" ] || { log "❌ sing-box: stock rollback package size does not match opkg metadata; unchanged"; return 1; }
+            STOCK_ROLLBACK_PACKAGE="$1"
+            STOCK_ROLLBACK_BINARY_VERSION=$(verify_stock_sing_box_ipk "$STOCK_ROLLBACK_PACKAGE" "$STOCK_PREVIOUS_VERSION" "$TMP_ENGINE_DIR/stock-sing-box" "$engine_arch") || {
+                log "❌ sing-box: stock rollback package metadata/binary verification failed; unchanged"
+                return 1
+            }
+            STOCK_ROLLBACK_BINARY_SHA256=$(sha256sum "$TMP_ENGINE_DIR/stock-sing-box" 2>/dev/null | awk 'NR == 1 {print $1}')
+            case "$STOCK_ROLLBACK_BINARY_SHA256" in ''|*[!0-9a-f]*)
+                log "❌ sing-box: stock rollback binary SHA256 is malformed; unchanged"
+                return 1 ;;
+            esac
+            [ "${#STOCK_ROLLBACK_BINARY_SHA256}" -eq 64 ] || {
+                log "❌ sing-box: stock rollback binary SHA256 is malformed; unchanged"
+                return 1
+            }
+            if ! persist_engine_recovery_package "$STOCK_ROLLBACK_PACKAGE" "$ENGINE_RECOVERY_DIR" /overlay stock "$STOCK_PREVIOUS_VERSION"; then
+                log "❌ sing-box: could not preserve exact stock rollback IPK on /overlay; unchanged"
+                return 1
+            fi
+            STOCK_ROLLBACK_PACKAGE="$ENGINE_RECOVERY_PACKAGE"
+            rm -f "$TMP_ENGINE_DIR/stock-sing-box"
+            ;;
+        podkop-engine)
+            if ! opkg --noaction install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
+                log "❌ sing-box: engine package dependency preflight failed; unchanged"
+                return 1
+            fi
+            download_engine_rollback_package "$ENGINE_PREVIOUS_VERSION" || return 1
+            ;;
+        unowned)
+            backup_unowned_sing_box || return 1
+            ;;
+        *)
+            log "❌ sing-box: unsupported package replacement origin; unchanged"
+            return 1 ;;
+    esac
 
-    log "📦 sing-box: replacing $ENGINE_ORIGIN binary with tested $TESTED_ENGINE_VERSION"
-    ENGINE_SWITCH_ACTIVE="1"
-    service podkop stop >/dev/null 2>&1
-    if [ "$ENGINE_ORIGIN" = "stock" ] && ! opkg remove --force-depends sing-box >/dev/null 2>&1; then
-        log "❌ sing-box: stock package removal failed; restoring original"
-        rollback_engine_once
-        return 1
-    fi
-    if ! opkg install "$TMP_ENGINE_DIR/new.ipk" >/dev/null 2>&1; then
-        log "❌ sing-box: install failed; restoring original"
-        rollback_engine_once
-        return 1
-    fi
-    service podkop restart >/dev/null 2>&1
-    if ! wait_for_engine_health ||
-        ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-        log "❌ sing-box: post-install check failed; restoring original"
-        rollback_engine_once
-        return 1
-    fi
-    ENGINE_SWITCH_ACTIVE="0"
-    log "✅ sing-box: $TESTED_ENGINE_VERSION installed; Podkop running"
+    install_candidate_engine || return 1
     return 0
 }
 
