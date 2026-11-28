@@ -4,7 +4,7 @@
 # Здесь можно указать:
 # - raw-ссылки на подписки
 # - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
-SCRIPT_VERSION="2026.11.25.1"
+SCRIPT_VERSION="2026.11.28.1"
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
@@ -13,9 +13,9 @@ UPDATE_INTERVAL_HOURS="3"
 FORCE_SETUP="0"
 UPDATES_ONLY="0"
 CHECK_SELF_UPDATE_ONLY="0"
-AUTO_UPDATE_SCRIPT="1"
+AUTO_UPDATE_SCRIPT="0"
 AUTO_UPDATE_PODKOP="0"
-AUTO_UPDATE_SING_BOX="1"
+AUTO_UPDATE_SING_BOX="0"
 # Pinned build selected for the current Podkop integration.
 TESTED_ENGINE_VERSION="1.14.4-r29"
 PODKOP_INSTALL_AUTO_YES="1"
@@ -54,8 +54,6 @@ AUTO_INSTALL_CRON="1"
 CRON_FILE="/etc/crontabs/root"
 CRON_SCHEDULE="0 */3 * * *"
 CRON_COMMAND="/usr/bin/podkop-update >> /var/log/podkop-update.log 2>&1"
-UPDATE_CRON_SCHEDULE="0 * * * *"
-UPDATE_CRON_COMMAND="/usr/bin/podkop-update --updates-only >> /var/log/podkop-update.log 2>&1"
 
 # URL для URLTest и последующей проверки доступности после перезапуска Podkop.
 URLTEST_TESTING_URL="https://cp.cloudflare.com/generate_204"
@@ -262,8 +260,8 @@ print_usage() {
 
 Опции:
   --setup          Запустить мастер настройки и сохранить ответы в $CONFIG_FILE
-  --updates-only   Проверить и установить обновления podkop-update и Podkop, затем выйти
-  --check-self-update  Проверить наличие новой версии podkop-update и выйти
+  --updates-only   Устаревшая опция: удаляет cron обновлений ПО, не обновляет ПО
+  --check-self-update  Только проверить наличие новой версии скрипта
   --version        Показать версию podkop-update и выйти
 EOF
 }
@@ -1689,6 +1687,14 @@ load_config() {
     return 0
 }
 
+# This updater is now restricted to subscription/server refreshes. Ignore old
+# saved settings that could re-enable updater, Podkop or sing-box software updates.
+disable_software_updates() {
+    AUTO_UPDATE_SCRIPT="0"
+    AUTO_UPDATE_PODKOP="0"
+    AUTO_UPDATE_SING_BOX="0"
+}
+
 save_config() {
     tmp_config="$(mktemp /tmp/podkop-update.conf.XXXXXX)" || return 1
 
@@ -1908,46 +1914,82 @@ ensure_device_headers() {
     fi
 }
 
-ensure_cron_job() {
-    [ "$AUTO_INSTALL_CRON" = "1" ] || return 0
+remove_legacy_update_cron() {
+    CRON_CHANGED="0"
+    [ -f "$CRON_FILE" ] || return 0
 
-    cron_line="${CRON_SCHEDULE} ${CRON_COMMAND}"
-    update_cron_line="${UPDATE_CRON_SCHEDULE} ${UPDATE_CRON_COMMAND}"
-
-    if [ -f "$CRON_FILE" ] &&
-       grep -Fxq "$cron_line" "$CRON_FILE" &&
-       grep -Fxq "$update_cron_line" "$CRON_FILE"; then
+    legacy_cron_tmp=$(mktemp "${CRON_FILE}.tmp.XXXXXX") || return 1
+    grep -Eiv 'podkop-update[[:space:]]+--updates-only([[:space:]]|$)' "$CRON_FILE" > "$legacy_cron_tmp" || :
+    if cmp -s "$legacy_cron_tmp" "$CRON_FILE"; then
+        rm -f "$legacy_cron_tmp"
         return 0
     fi
-
-    if [ ! -f "$CRON_FILE" ]; then
-        : > "$CRON_FILE" 2>/dev/null || {
-            log "⚠️  Не удалось создать $CRON_FILE"
-            return 1
-        }
+    if ! mv "$legacy_cron_tmp" "$CRON_FILE"; then
+        rm -f "$legacy_cron_tmp"
+        log "⚠️  Не удалось удалить старую cron-задачу обновления ПО"
+        return 1
     fi
+    CRON_CHANGED="1"
+}
 
-    sed -i '/\/usr\/bin\/podkop-update/d' "$CRON_FILE" 2>/dev/null || {
-        log "⚠️  Не удалось обновить cron в $CRON_FILE"
-        return 1
-    }
-
-    printf '%s\n' "$cron_line" >> "$CRON_FILE" || {
-        log "⚠️  Не удалось записать cron-задачу"
-        return 1
-    }
-
-    printf '%s\n' "$update_cron_line" >> "$CRON_FILE" || {
-        log "⚠️  Не удалось записать cron-задачу обновления"
-        return 1
-    }
-
+restart_cron() {
     /etc/init.d/cron restart >/dev/null 2>&1 || {
         log "⚠️  Не удалось перезапустить cron"
         return 1
     }
+}
 
-    log "⏰ Cron обновлен: подписки '$CRON_SCHEDULE', обновления '$UPDATE_CRON_SCHEDULE'"
+ensure_cron_job() {
+    CRON_CHANGED="0"
+    remove_legacy_update_cron || return 1
+
+    if [ "$AUTO_INSTALL_CRON" = "1" ]; then
+        cron_line="${CRON_SCHEDULE} ${CRON_COMMAND}"
+        [ -f "$CRON_FILE" ] || {
+            : > "$CRON_FILE" 2>/dev/null || {
+                log "⚠️  Не удалось создать $CRON_FILE"
+                return 1
+            }
+            CRON_CHANGED="1"
+        }
+
+        subscription_cron_tmp=$(mktemp "${CRON_FILE}.tmp.XXXXXX") || return 1
+        grep -Fv '/usr/bin/podkop-update' "$CRON_FILE" > "$subscription_cron_tmp" || :
+        printf '%s\n' "$cron_line" >> "$subscription_cron_tmp" || {
+            rm -f "$subscription_cron_tmp"
+            return 1
+        }
+        if ! cmp -s "$subscription_cron_tmp" "$CRON_FILE"; then
+            if ! mv "$subscription_cron_tmp" "$CRON_FILE"; then
+                rm -f "$subscription_cron_tmp"
+                log "⚠️  Не удалось записать cron-задачу подписок"
+                return 1
+            fi
+            CRON_CHANGED="1"
+        else
+            rm -f "$subscription_cron_tmp"
+        fi
+    fi
+
+    if [ "$CRON_CHANGED" = "1" ]; then
+        restart_cron || return 1
+    fi
+    if [ "$AUTO_INSTALL_CRON" = "1" ]; then
+        log "⏰ Cron настроен: только обновление подписок '$CRON_SCHEDULE'"
+    fi
+    return 0
+}
+
+run_updates_only() {
+    log "⚠️ software updates are disabled; legacy --updates-only does not update software"
+    ensure_cron_job
+}
+
+require_podkop_installed() {
+    podkop_init_script=${1:-/etc/init.d/podkop}
+    [ -x "$podkop_init_script" ] && return 0
+    log "❌ Podkop is not installed; this updater does not manage Forkop"
+    return 1
 }
 
 wait_for_podkop() {
@@ -2002,8 +2044,6 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-ensure_podkop_installed || exit 1
-
 if [ "$CHECK_SELF_UPDATE_ONLY" = "1" ]; then
     check_self_update
     exit $?
@@ -2017,16 +2057,14 @@ fi
 
 load_config >/dev/null 2>&1
 normalize_update_interval
+disable_software_updates
 
 if [ "$UPDATES_ONLY" = "1" ]; then
-    log "🔄 Проверка обновлений..."
-    ensure_script_updated
-    ensure_podkop_updated
-    ensure_sing_box_updated || exit 1
-    ensure_cron_job
-    log "✅ Проверка обновлений завершена"
+    run_updates_only || exit 1
     exit 0
 fi
+
+require_podkop_installed || exit 1
 
 # --- СКАЧИВАНИЕ ---
 # Загружает сырой текст/HTML/подписку
